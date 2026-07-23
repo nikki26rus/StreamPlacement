@@ -85,6 +85,7 @@ class Database:
                 notification_template TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}',
                 notification_description TEXT NOT NULL DEFAULT '',
                 preview_file_id TEXT,
+                notification_thread_id INTEGER,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -122,6 +123,7 @@ class Database:
             ),
             "notification_description": "TEXT NOT NULL DEFAULT ''",
             "preview_file_id": "TEXT",
+            "notification_thread_id": "INTEGER",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
         }
@@ -258,7 +260,8 @@ class Database:
         return self.connection.execute(
             """
             SELECT notification_template, notification_description, preview_file_id,
-                   notification_message_id, notification_has_photo
+                   notification_thread_id, notification_message_id,
+                   notification_has_photo
             FROM chats WHERE chat_id = ?
             """,
             (chat_id,),
@@ -282,6 +285,13 @@ class Database:
         self.connection.execute(
             "UPDATE chats SET preview_file_id = ? WHERE chat_id = ?",
             (file_id, chat_id),
+        )
+        self.connection.commit()
+
+    def set_notification_thread(self, chat_id: int, thread_id: int) -> None:
+        self.connection.execute(
+            "UPDATE chats SET notification_thread_id = ? WHERE chat_id = ?",
+            (thread_id, chat_id),
         )
         self.connection.commit()
 
@@ -674,6 +684,34 @@ async def track_connected_chat(
         "Бот подключён к чату chat_id=%s пользователем user_id=%s",
         chat.id,
         actor.id,
+    )
+
+
+async def topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat.type != "supergroup" or not chat.is_forum:
+        await message.reply_text(
+            "Эта команда работает только внутри темы Telegram-форума."
+        )
+        return
+    if not message.message_thread_id:
+        await message.reply_text("Открой нужную тему форума и повтори /topic там.")
+        return
+
+    member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await message.reply_text("Выбрать тему может только администратор форума.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.is_configured(chat.id):
+        database.connect_chat(
+            chat.id, chat.title or str(chat.id), update.effective_user.id
+        )
+    database.set_notification_thread(chat.id, message.message_thread_id)
+    await message.reply_text(
+        "Готово. Уведомления для этого форума теперь будут приходить в эту тему."
     )
 
 
@@ -1207,9 +1245,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if settings["notification_description"]
                 else "без описания"
             )
+            target = (
+                f"тема #{settings['notification_thread_id']}"
+                if settings["notification_thread_id"]
+                else "общий чат"
+            )
             lines.append(
                 f"• {chat['title']}: {settings['notification_template']} "
-                f"({preview}, {description})"
+                f"({target}, {preview}, {description})"
             )
         await query.edit_message_text("\n".join(lines))
 
@@ -1536,6 +1579,11 @@ async def send_or_edit_notification(
             )
 
     preview = settings["preview_file_id"] or notifications[0][1].thumbnail_url
+    thread_kwargs = (
+        {"message_thread_id": settings["notification_thread_id"]}
+        if settings["notification_thread_id"]
+        else {}
+    )
     if preview:
         try:
             message = await application.bot.send_photo(
@@ -1543,6 +1591,7 @@ async def send_or_edit_notification(
                 photo=preview,
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                **thread_kwargs,
             )
             database.set_notification_message(chat_id, message.message_id, has_photo=True)
             return
@@ -1558,6 +1607,7 @@ async def send_or_edit_notification(
         text=text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        **thread_kwargs,
     )
     database.set_notification_message(chat_id, message.message_id, has_photo=False)
 
@@ -1735,6 +1785,7 @@ def main() -> None:
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("template", template_command))
     application.add_handler(CommandHandler("preview", preview_command))
+    application.add_handler(CommandHandler("topic", topic_command))
     application.add_handler(MessageHandler(filters.PHOTO, receive_preview_photo))
     application.add_handler(
         CallbackQueryHandler(
