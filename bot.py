@@ -1,4 +1,5 @@
 import html
+from io import BytesIO
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, ImageDraw, ImageOps
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -48,6 +50,8 @@ REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_STREAMS_URL = "https://api.twitch.tv/helix/streams"
+TWITCH_USERS_URL = "https://api.twitch.tv/helix/users"
+TWITCH_GAMES_URL = "https://api.twitch.tv/helix/games"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
@@ -68,6 +72,8 @@ class LiveStream:
     url: str
     game_name: str | None = None
     thumbnail_url: str | None = None
+    broadcaster_logo_url: str | None = None
+    game_box_url: str | None = None
 
 
 class Database:
@@ -426,13 +432,14 @@ class StreamProviders:
 
     async def twitch_live(self, login: str) -> LiveStream | None:
         token = await self._twitch_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": TWITCH_CLIENT_ID,
+        }
         response = await self.client.get(
             TWITCH_STREAMS_URL,
             params={"user_login": login},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Client-Id": TWITCH_CLIENT_ID,
-            },
+            headers=headers,
         )
         response.raise_for_status()
         streams = response.json().get("data", [])
@@ -440,6 +447,24 @@ class StreamProviders:
             return None
 
         stream = streams[0]
+        user_response = await self.client.get(
+            TWITCH_USERS_URL,
+            params={"id": stream["user_id"]},
+            headers=headers,
+        )
+        user_response.raise_for_status()
+        user = (user_response.json().get("data") or [{}])[0]
+
+        game = {}
+        if stream.get("game_id"):
+            game_response = await self.client.get(
+                TWITCH_GAMES_URL,
+                params={"id": stream["game_id"]},
+                headers=headers,
+            )
+            game_response.raise_for_status()
+            game = (game_response.json().get("data") or [{}])[0]
+
         return LiveStream(
             stream_id=stream["id"],
             title=stream.get("title") or "Без названия",
@@ -448,6 +473,11 @@ class StreamProviders:
             thumbnail_url=(stream.get("thumbnail_url") or "")
             .replace("{width}", "1280")
             .replace("{height}", "720")
+            or None,
+            broadcaster_logo_url=user.get("profile_image_url") or None,
+            game_box_url=(game.get("box_art_url") or "")
+            .replace("{width}", "285")
+            .replace("{height}", "380")
             or None,
         )
 
@@ -589,6 +619,44 @@ class StreamProviders:
             game_name=category.get("name") or None,
             thumbnail_url=stream.get("thumbnail") or None,
         )
+
+    async def _download_image(self, url: str) -> Image.Image:
+        response = await self.client.get(url)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGB")
+
+    async def twitch_notification_preview(self, stream: LiveStream) -> BytesIO | None:
+        """Создаёт карточку из превью эфира, аватара стримера и обложки игры."""
+        if not stream.thumbnail_url:
+            return None
+        try:
+            background = await self._download_image(stream.thumbnail_url)
+            card = ImageOps.fit(background, (1280, 720), method=Image.Resampling.LANCZOS)
+            overlay = Image.new("RGBA", card.size, (0, 0, 0, 85))
+            card = Image.alpha_composite(card.convert("RGBA"), overlay)
+
+            if stream.broadcaster_logo_url:
+                avatar = await self._download_image(stream.broadcaster_logo_url)
+                avatar = ImageOps.fit(avatar, (150, 150), method=Image.Resampling.LANCZOS)
+                mask = Image.new("L", (150, 150), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, 150, 150), fill=255)
+                card.paste(avatar, (48, 522), mask)
+
+            if stream.game_box_url:
+                game = await self._download_image(stream.game_box_url)
+                game.thumbnail((150, 190), Image.Resampling.LANCZOS)
+                x = 1280 - game.width - 48
+                y = 720 - game.height - 40
+                card.paste(game, (x, y))
+
+            result = BytesIO()
+            result.name = "twitch-preview.jpg"
+            card.convert("RGB").save(result, format="JPEG", quality=90, optimize=True)
+            result.seek(0)
+            return result
+        except (httpx.HTTPError, OSError, ValueError) as error:
+            logger.warning("Не удалось создать карточку Twitch: %s", error)
+            return None
 
 
 def parse_twitch_url(url: str) -> tuple[str, str, str]:
@@ -1578,7 +1646,21 @@ async def send_or_edit_notification(
                 error,
             )
 
-    preview = settings["preview_file_id"] or notifications[0][1].thumbnail_url
+    preview = settings["preview_file_id"]
+    if not preview:
+        twitch_stream = next(
+            (
+                stream
+                for subscription, stream in notifications
+                if subscription["platform"] == "twitch"
+            ),
+            None,
+        )
+        if twitch_stream:
+            providers: StreamProviders = application.bot_data["providers"]
+            preview = await providers.twitch_notification_preview(twitch_stream)
+        if not preview:
+            preview = notifications[0][1].thumbnail_url
     thread_kwargs = (
         {"message_thread_id": settings["notification_thread_id"]}
         if settings["notification_thread_id"]
