@@ -1641,11 +1641,12 @@ async def select_example_chat(
         InlineKeyboardButton("🔴 YouTube", url="https://www.youtube.com/"),
         InlineKeyboardButton("🟢 Kick", url="https://kick.com/"),
     ]
+    sample_rows = [sample_buttons]
     if settings["discord_url"]:
-        sample_buttons.append(
-            InlineKeyboardButton("💬 Discord", url=settings["discord_url"])
+        sample_rows.append(
+            [InlineKeyboardButton("💬 Discord", url=settings["discord_url"])]
         )
-    sample_keyboard = InlineKeyboardMarkup([sample_buttons])
+    sample_keyboard = InlineKeyboardMarkup(sample_rows)
     try:
         if settings["preview_file_id"]:
             await context.bot.send_photo(
@@ -1772,18 +1773,20 @@ def notification_keyboard(
         )
         for platform in platform_names
     }
-    buttons = []
+    platform_buttons = []
     for subscription, stream in notifications:
         platform, emoji = platform_names[subscription["platform"]]
         label = f"{emoji} {platform}"
         if platform_counts[subscription["platform"]] > 1:
             label += f" · {subscription['channel_name']}"
-        buttons.append(InlineKeyboardButton(label, url=stream.url))
+        platform_buttons.append(InlineKeyboardButton(label, url=stream.url))
+    rows = [
+        platform_buttons[index : index + 8]
+        for index in range(0, len(platform_buttons), 8)
+    ]
     if discord_url:
-        buttons.append(InlineKeyboardButton("💬 Discord", url=discord_url))
-    return InlineKeyboardMarkup(
-        [buttons[index : index + 8] for index in range(0, len(buttons), 8)]
-    )
+        rows.append([InlineKeyboardButton("💬 Discord", url=discord_url)])
+    return InlineKeyboardMarkup(rows)
 
 
 async def active_streams_for_chat(
