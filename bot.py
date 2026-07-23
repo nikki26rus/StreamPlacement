@@ -545,11 +545,14 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await update.effective_message.reply_text("Проверяю каналы…")
-    await check_streams(
+    results = await check_streams(
         context.application,
         only_subscription_ids={subscription["id"] for subscription in subscriptions},
     )
-    await update.effective_message.reply_text("Проверка завершена.")
+    await update.effective_message.reply_text(
+        "Результат проверки:\n" + "\n".join(results),
+        disable_web_page_preview=True,
+    )
 
 
 async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -655,10 +658,11 @@ async def check_streams(
     application: Application,
     *,
     only_subscription_ids: set[int] | None = None,
-) -> None:
+) -> list[str]:
     database: Database = application.bot_data["database"]
     providers: StreamProviders = application.bot_data["providers"]
     subscriptions = database.get_all_subscriptions()
+    results = []
 
     for subscription in subscriptions:
         if (
@@ -676,9 +680,24 @@ async def check_streams(
                 subscription["channel_key"],
                 error,
             )
+            results.append(
+                f"⚠ #{subscription['id']} {subscription['platform']} "
+                f"{subscription['channel_name']}: ошибка API — {error}"
+            )
             continue
 
         stream_id = stream.stream_id if stream else None
+        if stream:
+            results.append(
+                f"🔴 #{subscription['id']} {subscription['platform']} "
+                f"{subscription['channel_name']}: эфир найден — {stream.title}"
+            )
+        else:
+            results.append(
+                f"⚪ #{subscription['id']} {subscription['platform']} "
+                f"{subscription['channel_name']}: API не нашёл активный эфир"
+            )
+
         if not subscription["initialized"]:
             database.set_state(
                 subscription["id"],
@@ -719,6 +738,8 @@ async def check_streams(
                 initialized=True,
                 active_stream_id=None,
             )
+
+    return results
 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
