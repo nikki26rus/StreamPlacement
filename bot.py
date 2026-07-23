@@ -1561,38 +1561,32 @@ def format_live_notification(
     lines = [f"<b>{header}</b>"]
     if description:
         lines.append(html.escape(description))
-    hidden_count = 0
-    platform_links = []
-    for subscription, stream in notifications:
-        platform, emoji = {
-            "twitch": ("Twitch", "🟣"),
-            "youtube": ("YouTube", "🔴"),
-            "kick": ("Kick", "🟢"),
-        }[subscription["platform"]]
-        title = html.escape(
-            stream.title[:160] + ("…" if len(stream.title) > 160 else "")
-        )
-        line = (
-            f"• <b>{platform} — {html.escape(subscription['channel_name'])}</b>\n"
-            f"{title}"
-        )
-        platform_link = (
-            f"<a href=\"{html.escape(stream.url, quote=True)}\">"
-            f"{emoji} {platform}: {html.escape(subscription['channel_name'])}</a>"
-        )
-        if len(
-            "\n\n".join(lines + [line, " · ".join(platform_links + [platform_link])])
-        ) > 1000:
-            hidden_count += 1
-            continue
-        lines.append(line)
-        platform_links.append(platform_link)
-
-    if hidden_count:
-        lines.append(f"…и ещё {hidden_count}.")
-    if platform_links:
-        lines.append(" · ".join(platform_links))
     return "\n\n".join(lines)
+
+
+def notification_keyboard(
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+) -> InlineKeyboardMarkup:
+    platform_names = {
+        "twitch": ("Twitch", "🟣"),
+        "youtube": ("YouTube", "🔴"),
+        "kick": ("Kick", "🟢"),
+    }
+    platform_counts = {
+        platform: sum(
+            subscription["platform"] == platform
+            for subscription, _ in notifications
+        )
+        for platform in platform_names
+    }
+    buttons = []
+    for subscription, stream in notifications:
+        platform, emoji = platform_names[subscription["platform"]]
+        label = f"{emoji} {platform}"
+        if platform_counts[subscription["platform"]] > 1:
+            label += f" · {subscription['channel_name']}"
+        buttons.append([InlineKeyboardButton(label, url=stream.url)])
+    return InlineKeyboardMarkup(buttons)
 
 
 async def active_streams_for_chat(
@@ -1635,6 +1629,7 @@ async def send_or_edit_notification(
         settings["notification_template"],
         settings["notification_description"],
     )
+    reply_markup = notification_keyboard(notifications)
     message_id = settings["notification_message_id"]
     if message_id:
         try:
@@ -1644,6 +1639,7 @@ async def send_or_edit_notification(
                     message_id=message_id,
                     caption=text,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
                 )
             else:
                 await application.bot.edit_message_text(
@@ -1652,6 +1648,7 @@ async def send_or_edit_notification(
                     text=text,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
+                    reply_markup=reply_markup,
                 )
             return
         except Exception as error:
@@ -1688,6 +1685,7 @@ async def send_or_edit_notification(
                 photo=preview,
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
                 **thread_kwargs,
             )
             database.set_notification_message(chat_id, message.message_id, has_photo=True)
@@ -1704,6 +1702,7 @@ async def send_or_edit_notification(
         text=text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
         **thread_kwargs,
     )
     database.set_notification_message(chat_id, message.message_id, has_photo=False)
