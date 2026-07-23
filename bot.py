@@ -99,6 +99,7 @@ class Database:
                 notification_template TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}',
                 notification_description TEXT NOT NULL DEFAULT '',
                 preview_file_id TEXT,
+                discord_url TEXT,
                 notification_thread_id INTEGER,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
@@ -137,6 +138,7 @@ class Database:
             ),
             "notification_description": "TEXT NOT NULL DEFAULT ''",
             "preview_file_id": "TEXT",
+            "discord_url": "TEXT",
             "notification_thread_id": "INTEGER",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
@@ -274,7 +276,7 @@ class Database:
         return self.connection.execute(
             """
             SELECT notification_template, notification_description, preview_file_id,
-                   notification_thread_id, notification_message_id,
+                   discord_url, notification_thread_id, notification_message_id,
                    notification_has_photo
             FROM chats WHERE chat_id = ?
             """,
@@ -299,6 +301,13 @@ class Database:
         self.connection.execute(
             "UPDATE chats SET preview_file_id = ? WHERE chat_id = ?",
             (file_id, chat_id),
+        )
+        self.connection.commit()
+
+    def set_discord_url(self, chat_id: int, url: str) -> None:
+        self.connection.execute(
+            "UPDATE chats SET discord_url = ? WHERE chat_id = ?",
+            (url, chat_id),
         )
         self.connection.commit()
 
@@ -690,6 +699,22 @@ def parse_kick_url(url: str) -> str:
     return slug
 
 
+def parse_discord_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if parsed.scheme != "https" or host not in {"discord.gg", "discord.com"}:
+        raise ValueError(
+            "Нужна ссылка-приглашение вида https://discord.gg/название"
+        )
+    if host == "discord.com" and not parsed.path.startswith("/invite/"):
+        raise ValueError(
+            "Нужна ссылка-приглашение вида https://discord.com/invite/название"
+        )
+    if not parsed.path.strip("/"):
+        raise ValueError("Ссылка-приглашение Discord неполная")
+    return url
+
+
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -707,6 +732,7 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_subscription",
         "pending_template",
         "pending_description",
+        "pending_discord_url",
         "awaiting_preview",
         "pending_preview_file_id",
     ):
@@ -1124,6 +1150,7 @@ async def show_appearance_menu(
                 [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
                 [InlineKeyboardButton("Изменить описание", callback_data="appearance:description")],
                 [InlineKeyboardButton("Установить картинку", callback_data="appearance:preview")],
+                [InlineKeyboardButton("Добавить Discord", callback_data="appearance:discord")],
                 [InlineKeyboardButton("Показать пример", callback_data="appearance:example")],
                 [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
@@ -1207,6 +1234,33 @@ async def choose_example_target(
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
     await update.effective_message.reply_text(
         "Выбери настройки какого канала или группы показать:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_discord_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+
+    context.user_data["pending_discord_url"] = url
+    context.user_data["wizard"] = "discord_target"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"discord_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу для Discord-кнопки:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -1337,6 +1391,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Выбираю настройки для примера.")
         await choose_example_target(update, context)
         return
+    if data == "appearance:discord":
+        clear_wizard(context)
+        context.user_data["wizard"] = "discord_text"
+        await query.edit_message_text(
+            "Пришли ссылку-приглашение Discord.\n"
+            "Например: https://discord.gg/название"
+        )
+        return
     if data == "appearance:status":
         chats = database.list_user_chats(update.effective_user.id)
         if not chats:
@@ -1356,9 +1418,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if settings["notification_thread_id"]
                 else "общий чат"
             )
+            discord = "Discord подключён" if settings["discord_url"] else "без Discord"
             lines.append(
                 f"• {chat['title']}: {settings['notification_template']} "
-                f"({target}, {preview}, {description})"
+                f"({target}, {preview}, {description}, {discord})"
             )
         await query.edit_message_text("\n".join(lines))
 
@@ -1424,6 +1487,16 @@ async def menu_text_handler(
             )
             return
         await choose_description_target(update, context, text)
+        return
+    if wizard == "discord_text":
+        try:
+            discord_url = parse_discord_url(text)
+        except ValueError as error:
+            await update.effective_message.reply_text(
+                f"{error}\nПришли корректную ссылку или нажми «Отмена»."
+            )
+            return
+        await choose_discord_target(update, context, discord_url)
         return
 
     await update.effective_message.reply_text(
@@ -1563,13 +1636,16 @@ async def select_example_chat(
         settings["notification_template"].replace("{count}", "1"),
         settings["notification_description"],
     )
-    sample_keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🟣 Twitch", url="https://www.twitch.tv/")],
-            [InlineKeyboardButton("🔴 YouTube", url="https://www.youtube.com/")],
-            [InlineKeyboardButton("🟢 Kick", url="https://kick.com/")],
-        ]
-    )
+    sample_buttons = [
+        InlineKeyboardButton("🟣 Twitch", url="https://www.twitch.tv/"),
+        InlineKeyboardButton("🔴 YouTube", url="https://www.youtube.com/"),
+        InlineKeyboardButton("🟢 Kick", url="https://kick.com/"),
+    ]
+    if settings["discord_url"]:
+        sample_buttons.append(
+            InlineKeyboardButton("💬 Discord", url=settings["discord_url"])
+        )
+    sample_keyboard = InlineKeyboardMarkup([sample_buttons])
     try:
         if settings["preview_file_id"]:
             await context.bot.send_photo(
@@ -1593,6 +1669,37 @@ async def select_example_chat(
 
     await query.edit_message_text(
         "Пример отправлен сюда, в личный чат. Уведомление в канале не публиковалось."
+    )
+
+
+async def select_discord_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    url = context.user_data.get("pending_discord_url")
+    if not url or not query.data.startswith("discord_chat:"):
+        await query.edit_message_text(
+            "Эта кнопка уже неактуальна. Открой «Оформление» заново."
+        )
+        return
+
+    try:
+        chat_id = int(query.data.removeprefix("discord_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    database.set_discord_url(chat_id, url)
+    context.user_data.pop("pending_discord_url", None)
+    context.user_data.pop("wizard", None)
+    await query.edit_message_text(
+        "Discord-ссылка сохранена. Кнопка появится в следующем уведомлении."
     )
 
 
@@ -1651,6 +1758,7 @@ def format_live_notification(
 
 def notification_keyboard(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
+    discord_url: str | None,
 ) -> InlineKeyboardMarkup:
     platform_names = {
         "twitch": ("Twitch", "🟣"),
@@ -1670,8 +1778,12 @@ def notification_keyboard(
         label = f"{emoji} {platform}"
         if platform_counts[subscription["platform"]] > 1:
             label += f" · {subscription['channel_name']}"
-        buttons.append([InlineKeyboardButton(label, url=stream.url)])
-    return InlineKeyboardMarkup(buttons)
+        buttons.append(InlineKeyboardButton(label, url=stream.url))
+    if discord_url:
+        buttons.append(InlineKeyboardButton("💬 Discord", url=discord_url))
+    return InlineKeyboardMarkup(
+        [buttons[index : index + 8] for index in range(0, len(buttons), 8)]
+    )
 
 
 async def active_streams_for_chat(
@@ -1714,7 +1826,7 @@ async def send_or_edit_notification(
         settings["notification_template"],
         settings["notification_description"],
     )
-    reply_markup = notification_keyboard(notifications)
+    reply_markup = notification_keyboard(notifications, settings["discord_url"])
     message_id = settings["notification_message_id"]
     if message_id:
         try:
@@ -2002,6 +2114,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_example_chat, pattern=r"^example_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_discord_chat, pattern=r"^discord_chat:")
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
