@@ -44,7 +44,15 @@ TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
-POLL_INTERVAL_SECONDS = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "120")))
+FAST_POLL_INTERVAL_SECONDS = max(
+    5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "10"))
+)
+YOUTUBE_POLL_INTERVAL_SECONDS = max(
+    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "30"))
+)
+COMBINE_DELAY_SECONDS = max(
+    0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
+)
 DB_PATH = Path(os.getenv("DB_PATH", "data/streams.db"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 
@@ -1554,29 +1562,36 @@ def format_live_notification(
     if description:
         lines.append(html.escape(description))
     hidden_count = 0
+    platform_links = []
     for subscription, stream in notifications:
-        platform = {
-            "twitch": "Twitch",
-            "youtube": "YouTube",
-            "kick": "Kick",
+        platform, emoji = {
+            "twitch": ("Twitch", "🟣"),
+            "youtube": ("YouTube", "🔴"),
+            "kick": ("Kick", "🟢"),
         }[subscription["platform"]]
-        title = html.escape(stream.title[:160] + ("…" if len(stream.title) > 160 else ""))
-        details = (
-            f"\nКатегория: {html.escape(stream.game_name[:80])}"
-            if stream.game_name
-            else ""
+        title = html.escape(
+            stream.title[:160] + ("…" if len(stream.title) > 160 else "")
         )
         line = (
             f"• <b>{platform} — {html.escape(subscription['channel_name'])}</b>\n"
-            f"<a href=\"{html.escape(stream.url, quote=True)}\">{title}</a>{details}"
+            f"{title}"
         )
-        if len("\n\n".join(lines + [line])) > 1000:
+        platform_link = (
+            f"<a href=\"{html.escape(stream.url, quote=True)}\">"
+            f"{emoji} {platform}: {html.escape(subscription['channel_name'])}</a>"
+        )
+        if len(
+            "\n\n".join(lines + [line, " · ".join(platform_links + [platform_link])])
+        ) > 1000:
             hidden_count += 1
             continue
         lines.append(line)
+        platform_links.append(platform_link)
 
     if hidden_count:
         lines.append(f"…и ещё {hidden_count}.")
+    if platform_links:
+        lines.append(" · ".join(platform_links))
     return "\n\n".join(lines)
 
 
@@ -1716,12 +1731,19 @@ async def check_streams(
     results = []
     started_chats: set[int] = set()
     changed_chats: set[int] = set()
+    check_youtube = (
+        only_subscription_ids is not None
+        or time.monotonic() - application.bot_data["last_youtube_check"]
+        >= YOUTUBE_POLL_INTERVAL_SECONDS
+    )
 
     for subscription in subscriptions:
         if (
             only_subscription_ids is not None
             and subscription["id"] not in only_subscription_ids
         ):
+            continue
+        if subscription["platform"] == "youtube" and not check_youtube:
             continue
 
         try:
@@ -1781,6 +1803,9 @@ async def check_streams(
             )
             changed_chats.add(subscription["chat_id"])
 
+    if check_youtube:
+        application.bot_data["last_youtube_check"] = time.monotonic()
+
     pending_chats: set[int] = application.bot_data["pending_notification_chats"]
     for chat_id in started_chats:
         settings = database.get_notification_settings(chat_id)
@@ -1790,7 +1815,7 @@ async def check_streams(
             pending_chats.add(chat_id)
             application.job_queue.run_once(
                 delayed_notification,
-                when=15,
+                when=COMBINE_DELAY_SECONDS,
                 data=chat_id,
                 name=f"combined-notification-{chat_id}",
             )
@@ -1816,11 +1841,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(application: Application) -> None:
     application.job_queue.run_repeating(
         scheduled_check,
-        interval=POLL_INTERVAL_SECONDS,
-        first=10,
+        interval=FAST_POLL_INTERVAL_SECONDS,
+        first=5,
         name="stream-status-check",
     )
-    logger.info("Проверка стримов каждые %d секунд", POLL_INTERVAL_SECONDS)
+    logger.info(
+        "Проверка Twitch/Kick каждые %d секунд, YouTube каждые %d секунд",
+        FAST_POLL_INTERVAL_SECONDS,
+        YOUTUBE_POLL_INTERVAL_SECONDS,
+    )
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1850,6 +1879,7 @@ def main() -> None:
     application.bot_data["database"] = database
     application.bot_data["providers"] = providers
     application.bot_data["pending_notification_chats"] = set()
+    application.bot_data["last_youtube_check"] = 0.0
 
     application.add_error_handler(on_error)
     application.add_handler(
