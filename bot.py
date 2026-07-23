@@ -66,6 +66,10 @@ TWITCH_USERS_URL = "https://api.twitch.tv/helix/users"
 TWITCH_GAMES_URL = "https://api.twitch.tv/helix/games"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEO_CATEGORIES_URL = (
+    "https://www.googleapis.com/youtube/v3/videoCategories"
+)
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
 KICK_CHANNELS_URL = "https://api.kick.com/public/v1/channels"
 ADMIN_STATUSES = {"creator", "owner", "administrator"}
@@ -492,6 +496,7 @@ class StreamProviders:
         self.twitch_token_expires_at = 0.0
         self.kick_access_token: str | None = None
         self.kick_token_expires_at = 0.0
+        self.youtube_category_names: dict[str, str] = {}
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -641,13 +646,48 @@ class StreamProviders:
             or thumbnails.get("default")
             or {}
         ).get("url")
+        video_response = await self.client.get(
+            YOUTUBE_VIDEOS_URL,
+            params={"part": "snippet", "id": video_id, "key": YOUTUBE_API_KEY},
+        )
+        video_response.raise_for_status()
+        video_snippet = (
+            (video_response.json().get("items") or [{}])[0].get("snippet") or {}
+        )
+        category_name = await self._youtube_category_name(
+            video_snippet.get("categoryId") or ""
+        )
         return LiveStream(
             stream_id=video_id,
             title=snippet.get("title") or "Без названия",
             url=f"https://www.youtube.com/watch?v={video_id}",
             thumbnail_url=thumbnail,
             started_at=snippet.get("publishedAt") or None,
+            game_name=category_name,
         )
+
+    async def _youtube_category_name(self, category_id: str) -> str | None:
+        if not category_id:
+            return None
+        if category_id in self.youtube_category_names:
+            return self.youtube_category_names[category_id]
+        response = await self.client.get(
+            YOUTUBE_VIDEO_CATEGORIES_URL,
+            params={
+                "part": "snippet",
+                "id": category_id,
+                "regionCode": "RU",
+                "key": YOUTUBE_API_KEY,
+            },
+        )
+        response.raise_for_status()
+        categories = response.json().get("items", [])
+        if not categories:
+            return None
+        name = categories[0]["snippet"].get("title")
+        if name:
+            self.youtube_category_names[category_id] = name
+        return name or None
 
     async def _kick_token(self) -> str:
         if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
@@ -1137,8 +1177,10 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text(
             "Формат: /template <текст>\n\n"
             "Это заголовок уведомления. Можно использовать {count} — "
-            "число начавшихся эфиров, и {time} — время начала.\n"
-            "Пример: /template 🔴 Эфир начался в {time}"
+            "число начавшихся эфиров, {time} — время начала, а также "
+            "{titleYT}, {titleTwich}, {titleKick} и {categoryYT}, "
+            "{categoryTwich}, {categoryKick}.\n"
+            "Пример: /template 🔴 {titleTwich} начал эфир в {time}"
         )
         return
 
@@ -1501,7 +1543,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["wizard"] = "template_text"
         await query.edit_message_text(
             "Пришли новый заголовок уведомления. Можно использовать {count} — "
-            "число новых эфиров, и {time} — время начала."
+            "число новых эфиров, {time} — время начала, названия {titleYT}, "
+            "{titleTwich}, {titleKick} и категории {categoryYT}, "
+            "{categoryTwich}, {categoryKick}."
         )
         return
     if data == "appearance:description":
@@ -1509,7 +1553,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["wizard"] = "description_text"
         await query.edit_message_text(
             "Пришли описание для уведомления: правила, ссылки или другую "
-            "информацию. Доступны {count} и {time}. Максимум 350 символов."
+            "информацию. Доступны {count}, {time}, {titleYT}, {titleTwich}, "
+            "{titleKick}, {categoryYT}, {categoryTwich}, {categoryKick}. "
+            "Максимум 350 символов."
         )
         return
     if data == "appearance:preview":
@@ -2083,6 +2129,19 @@ def notification_start_time(
     return min(start_times).astimezone(timezone).strftime("%H:%M")
 
 
+def notification_platform_value(
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+    platform: str,
+    field: str,
+) -> str:
+    values = [
+        getattr(stream, field)
+        for subscription, stream in notifications
+        if subscription["platform"] == platform and getattr(stream, field)
+    ]
+    return " · ".join(values) if values else "—"
+
+
 def format_live_notification(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
     template: str,
@@ -2095,6 +2154,22 @@ def format_live_notification(
             count_override if count_override is not None else len(notifications)
         ),
         "{time}": notification_start_time(notifications),
+        "{titleYT}": notification_platform_value(notifications, "youtube", "title"),
+        "{titleTwich}": notification_platform_value(notifications, "twitch", "title"),
+        "{titleTwitch}": notification_platform_value(notifications, "twitch", "title"),
+        "{titleKick}": notification_platform_value(notifications, "kick", "title"),
+        "{categoryYT}": notification_platform_value(
+            notifications, "youtube", "game_name"
+        ),
+        "{categoryTwich}": notification_platform_value(
+            notifications, "twitch", "game_name"
+        ),
+        "{categoryTwitch}": notification_platform_value(
+            notifications, "twitch", "game_name"
+        ),
+        "{categoryKick}": notification_platform_value(
+            notifications, "kick", "game_name"
+        ),
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
