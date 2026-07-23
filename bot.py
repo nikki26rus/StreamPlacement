@@ -1671,6 +1671,8 @@ async def send_or_edit_notification(
         if twitch_stream:
             providers: StreamProviders = application.bot_data["providers"]
             preview = await providers.twitch_notification_preview(twitch_stream)
+            if not preview:
+                preview = twitch_stream.thumbnail_url
         if not preview:
             preview = notifications[0][1].thumbnail_url
     thread_kwargs = (
