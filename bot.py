@@ -48,7 +48,7 @@ FAST_POLL_INTERVAL_SECONDS = max(
     5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "10"))
 )
 YOUTUBE_POLL_INTERVAL_SECONDS = max(
-    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "30"))
+    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "120"))
 )
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
