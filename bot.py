@@ -7,8 +7,10 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, ImageDraw, ImageOps
@@ -53,6 +55,7 @@ YOUTUBE_POLL_INTERVAL_SECONDS = max(
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
 )
+NOTIFICATION_TIMEZONE = os.getenv("NOTIFICATION_TIMEZONE", "Europe/Moscow")
 DB_PATH = Path(os.getenv("DB_PATH", "data/streams.db"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 
@@ -82,6 +85,7 @@ class LiveStream:
     thumbnail_url: str | None = None
     broadcaster_logo_url: str | None = None
     game_box_url: str | None = None
+    started_at: str | None = None
 
 
 class Database:
@@ -304,6 +308,13 @@ class Database:
         )
         self.connection.commit()
 
+    def clear_preview_file_id(self, chat_id: int) -> None:
+        self.connection.execute(
+            "UPDATE chats SET preview_file_id = NULL WHERE chat_id = ?",
+            (chat_id,),
+        )
+        self.connection.commit()
+
     def set_discord_url(self, chat_id: int, url: str) -> None:
         self.connection.execute(
             "UPDATE chats SET discord_url = ? WHERE chat_id = ?",
@@ -496,6 +507,7 @@ class StreamProviders:
             .replace("{width}", "285")
             .replace("{height}", "380")
             or None,
+            started_at=stream.get("started_at") or None,
         )
 
     async def youtube_channel_id(self, url: str) -> tuple[str, str, str]:
@@ -572,6 +584,7 @@ class StreamProviders:
             title=snippet.get("title") or "Без названия",
             url=f"https://www.youtube.com/watch?v={video_id}",
             thumbnail_url=thumbnail,
+            started_at=snippet.get("publishedAt") or None,
         )
 
     async def _kick_token(self) -> str:
@@ -635,6 +648,7 @@ class StreamProviders:
             url=f"https://kick.com/{channel['slug']}",
             game_name=category.get("name") or None,
             thumbnail_url=stream.get("thumbnail") or None,
+            started_at=stream.get("start_time") or None,
         )
 
     async def _download_image(self, url: str) -> Image.Image:
@@ -654,14 +668,14 @@ class StreamProviders:
 
             if stream.broadcaster_logo_url:
                 avatar = await self._download_image(stream.broadcaster_logo_url)
-                avatar = ImageOps.fit(avatar, (150, 150), method=Image.Resampling.LANCZOS)
-                mask = Image.new("L", (150, 150), 0)
-                ImageDraw.Draw(mask).ellipse((0, 0, 150, 150), fill=255)
-                card.paste(avatar, (48, 522), mask)
+                avatar = ImageOps.fit(avatar, (225, 225), method=Image.Resampling.LANCZOS)
+                mask = Image.new("L", (225, 225), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, 225, 225), fill=255)
+                card.paste(avatar, (48, 447), mask)
 
             if stream.game_box_url:
                 game = await self._download_image(stream.game_box_url)
-                game.thumbnail((150, 190), Image.Resampling.LANCZOS)
+                game.thumbnail((300, 380), Image.Resampling.LANCZOS)
                 x = 1280 - game.width - 48
                 y = 720 - game.height - 40
                 card.paste(game, (x, y))
@@ -1059,8 +1073,8 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text(
             "Формат: /template <текст>\n\n"
             "Это заголовок уведомления. Можно использовать {count} — "
-            "число начавшихся эфиров.\n"
-            "Пример: /template 🔴 В эфире прямо сейчас: {count}"
+            "число начавшихся эфиров, и {time} — время начала.\n"
+            "Пример: /template 🔴 Эфир начался в {time}"
         )
         return
 
@@ -1150,6 +1164,7 @@ async def show_appearance_menu(
                 [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
                 [InlineKeyboardButton("Изменить описание", callback_data="appearance:description")],
                 [InlineKeyboardButton("Установить картинку", callback_data="appearance:preview")],
+                [InlineKeyboardButton("Удалить свою картинку", callback_data="appearance:clear_preview")],
                 [InlineKeyboardButton("Добавить Discord", callback_data="appearance:discord")],
                 [InlineKeyboardButton("Показать пример", callback_data="appearance:example")],
                 [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
@@ -1265,6 +1280,31 @@ async def choose_discord_target(
     )
 
 
+async def choose_preview_clear_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"clear_preview_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, где удалить свою картинку:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1371,7 +1411,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["wizard"] = "template_text"
         await query.edit_message_text(
             "Пришли новый заголовок уведомления. Можно использовать {count} — "
-            "число новых эфиров."
+            "число новых эфиров, и {time} — время начала."
         )
         return
     if data == "appearance:description":
@@ -1379,13 +1419,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["wizard"] = "description_text"
         await query.edit_message_text(
             "Пришли описание для уведомления: правила, ссылки или другую "
-            "информацию. Максимум 350 символов."
+            "информацию. Доступны {count} и {time}. Максимум 350 символов."
         )
         return
     if data == "appearance:preview":
         clear_wizard(context)
         context.user_data["awaiting_preview"] = True
         await query.edit_message_text("Пришли картинку как фото.")
+        return
+    if data == "appearance:clear_preview":
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_preview_clear_target(update, context)
         return
     if data == "appearance:example":
         await query.edit_message_text("Выбираю настройки для примера.")
@@ -1579,7 +1623,8 @@ async def select_template_chat(
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
         "Заголовок уведомления сохранён.\n"
-        f"Предпросмотр: {template.replace('{count}', '2')}"
+        "Предпросмотр: "
+        f"{template.replace('{count}', '2').replace('{time}', '12:00')}"
     )
 
 
@@ -1633,8 +1678,9 @@ async def select_example_chat(
     settings = database.get_notification_settings(chat_id)
     text = format_live_notification(
         [],
-        settings["notification_template"].replace("{count}", "1"),
+        settings["notification_template"],
         settings["notification_description"],
+        count_override=1,
     )
     sample_buttons = [
         InlineKeyboardButton("🟣 Twitch", url="https://www.twitch.tv/"),
@@ -1704,6 +1750,29 @@ async def select_discord_chat(
     )
 
 
+async def select_preview_clear_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("clear_preview_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    database.clear_preview_file_id(chat_id)
+    await query.edit_message_text(
+        "Своя картинка удалена. В следующем уведомлении будет использовано "
+        "автоматическое превью."
+    )
+
+
 async def select_preview_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1745,12 +1814,46 @@ async def fetch_live_stream(
     raise RuntimeError(f"Неизвестная платформа {subscription['platform']}")
 
 
+def notification_start_time(
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+) -> str:
+    start_times = []
+    for _, stream in notifications:
+        if not stream.started_at:
+            continue
+        try:
+            start_times.append(
+                datetime.fromisoformat(stream.started_at.replace("Z", "+00:00"))
+            )
+        except ValueError:
+            continue
+    if not start_times:
+        return "сейчас"
+
+    try:
+        timezone = ZoneInfo(NOTIFICATION_TIMEZONE)
+    except Exception:
+        timezone = ZoneInfo("UTC")
+    return min(start_times).astimezone(timezone).strftime("%H:%M")
+
+
 def format_live_notification(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
     template: str,
     description: str,
+    *,
+    count_override: int | None = None,
 ) -> str:
-    header = html.escape(template.replace("{count}", str(len(notifications))))
+    replacements = {
+        "{count}": str(
+            count_override if count_override is not None else len(notifications)
+        ),
+        "{time}": notification_start_time(notifications),
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+        description = description.replace(placeholder, value)
+    header = html.escape(template)
     lines = [f"<b>{header}</b>"]
     if description:
         lines.append(html.escape(description))
@@ -2120,6 +2223,11 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_discord_chat, pattern=r"^discord_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            select_preview_clear_chat, pattern=r"^clear_preview_chat:"
+        )
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
