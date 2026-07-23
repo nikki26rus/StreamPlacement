@@ -65,6 +65,7 @@ class Database:
                 chat_id INTEGER PRIMARY KEY,
                 title TEXT NOT NULL,
                 configured_by INTEGER NOT NULL,
+                notification_template TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -90,6 +91,18 @@ class Database:
             );
             """
         )
+        chat_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(chats)").fetchall()
+        }
+        if "notification_template" not in chat_columns:
+            self.connection.execute(
+                """
+                ALTER TABLE chats
+                ADD COLUMN notification_template TEXT NOT NULL
+                DEFAULT '🔴 Новые эфиры: {count}'
+                """
+            )
         self.connection.commit()
 
     def connect_chat(self, chat_id: int, title: str, user_id: int) -> None:
@@ -171,6 +184,20 @@ class Database:
                 (user_id, chat_id),
             ).fetchone()
         )
+
+    def get_notification_template(self, chat_id: int) -> str:
+        row = self.connection.execute(
+            "SELECT notification_template FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return row["notification_template"] if row else "🔴 Новые эфиры: {count}"
+
+    def set_notification_template(self, chat_id: int, template: str) -> None:
+        self.connection.execute(
+            "UPDATE chats SET notification_template = ? WHERE chat_id = ?",
+            (template, chat_id),
+        )
+        self.connection.commit()
 
     def list_user_subscriptions(self, user_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -400,6 +427,8 @@ def help_text() -> str:
         "/list — отслеживаемые каналы\n"
         "/remove <номер> — удалить канал\n"
         "/check — проверить свои каналы сейчас\n\n"
+        "/template <текст> — изменить заголовок уведомления для канала или группы\n"
+        "В тексте можно использовать {count} — число новых эфиров.\n\n"
         "Первый опрос только запоминает текущий статус: уже идущий эфир "
         "не вызовет уведомление. Следующий новый эфир — вызовет."
     )
@@ -573,6 +602,50 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "Настройка текста уведомления доступна в личке с ботом."
+        )
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Формат: /template <текст>\n\n"
+            "Это заголовок уведомления. Можно использовать {count} — "
+            "число начавшихся эфиров.\n"
+            "Пример: /template 🔴 В эфире прямо сейчас: {count}"
+        )
+        return
+
+    template = " ".join(context.args).strip()
+    if len(template) > 300:
+        await update.effective_message.reply_text(
+            "Текст слишком длинный: максимум 300 символов."
+        )
+        return
+
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await update.effective_message.reply_text("Нет доступных каналов или групп.")
+        return
+
+    context.user_data["pending_template"] = template
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"template_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, для которых изменить заголовок уведомления:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def select_target_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -620,6 +693,35 @@ async def select_target_chat(
     )
 
 
+async def select_template_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    template = context.user_data.get("pending_template")
+    if template is None or not query.data.startswith("template_chat:"):
+        await query.edit_message_text("Эта кнопка уже неактуальна. Повтори /template.")
+        return
+
+    try:
+        chat_id = int(query.data.removeprefix("template_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори /template.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    database.set_notification_template(chat_id, template)
+    context.user_data.pop("pending_template", None)
+    await query.edit_message_text(
+        "Заголовок уведомления сохранён.\n"
+        f"Предпросмотр: {template.replace('{count}', '2')}"
+    )
+
+
 async def fetch_live_stream(
     providers: StreamProviders, subscription: sqlite3.Row
 ) -> LiveStream | None:
@@ -632,25 +734,56 @@ async def fetch_live_stream(
 
 async def send_live_notification(
     application: Application,
-    subscription: sqlite3.Row,
-    stream: LiveStream,
+    chat_id: int,
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+    template: str,
 ) -> None:
-    platform = "Twitch" if subscription["platform"] == "twitch" else "YouTube"
-    details = (
-        f"\nКатегория: {html.escape(stream.game_name)}"
-        if stream.game_name
-        else ""
-    )
-    text = (
-        f"🔴 <b>{platform}: {html.escape(subscription['channel_name'])} в эфире</b>\n"
-        f"<a href=\"{html.escape(stream.url, quote=True)}\">"
-        f"{html.escape(stream.title)}</a>{details}"
-    )
+    header = html.escape(template.replace("{count}", str(len(notifications))))
+    lines = [f"<b>{header}</b>"]
+    hidden_count = 0
+    for subscription, stream in notifications:
+        platform = "Twitch" if subscription["platform"] == "twitch" else "YouTube"
+        title = html.escape(stream.title[:160] + ("…" if len(stream.title) > 160 else ""))
+        details = (
+            f"\nКатегория: {html.escape(stream.game_name[:80])}"
+            if stream.game_name
+            else ""
+        )
+        line = (
+            f"• <b>{platform} — {html.escape(subscription['channel_name'])}</b>\n"
+            f"<a href=\"{html.escape(stream.url, quote=True)}\">{title}</a>{details}"
+        )
+        if len("\n\n".join(lines + [line])) > 950:
+            hidden_count += 1
+            continue
+        lines.append(line)
+
+    if hidden_count:
+        lines.append(f"…и ещё {hidden_count}.")
+    text = "\n\n".join(lines)
+    thumbnail_url = notifications[0][1].thumbnail_url
+
+    if thumbnail_url:
+        try:
+            await application.bot.send_photo(
+                chat_id=chat_id,
+                photo=thumbnail_url,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception as error:
+            logger.warning(
+                "Не удалось отправить превью в chat_id=%s, отправляю текст: %s",
+                chat_id,
+                error,
+            )
+
     await application.bot.send_message(
-        chat_id=subscription["chat_id"],
+        chat_id=chat_id,
         text=text,
         parse_mode=ParseMode.HTML,
-        disable_web_page_preview=False,
+        disable_web_page_preview=True,
     )
 
 
@@ -663,6 +796,7 @@ async def check_streams(
     providers: StreamProviders = application.bot_data["providers"]
     subscriptions = database.get_all_subscriptions()
     results = []
+    pending_notifications: dict[int, list[tuple[sqlite3.Row, LiveStream]]] = {}
 
     for subscription in subscriptions:
         if (
@@ -713,30 +847,42 @@ async def check_streams(
             continue
 
         if stream and stream_id != subscription["active_stream_id"]:
-            try:
-                await send_live_notification(application, subscription, stream)
-            except Exception as error:
-                logger.warning(
-                    "Не удалось отправить уведомление в chat_id=%s: %s",
-                    subscription["chat_id"],
-                    error,
-                )
-                continue
-            database.set_state(
-                subscription["id"],
-                initialized=True,
-                active_stream_id=stream_id,
-            )
-            logger.info(
-                "Отправлено уведомление: %s/%s",
-                subscription["platform"],
-                subscription["channel_key"],
+            pending_notifications.setdefault(subscription["chat_id"], []).append(
+                (subscription, stream)
             )
         elif not stream and subscription["active_stream_id"] is not None:
             database.set_state(
                 subscription["id"],
                 initialized=True,
                 active_stream_id=None,
+            )
+
+    for chat_id, notifications in pending_notifications.items():
+        try:
+            await send_live_notification(
+                application,
+                chat_id,
+                notifications,
+                database.get_notification_template(chat_id),
+            )
+        except Exception as error:
+            logger.warning(
+                "Не удалось отправить уведомление в chat_id=%s: %s",
+                chat_id,
+                error,
+            )
+            continue
+
+        for subscription, stream in notifications:
+            database.set_state(
+                subscription["id"],
+                initialized=True,
+                active_stream_id=stream.stream_id,
+            )
+            logger.info(
+                "Отправлено уведомление: %s/%s",
+                subscription["platform"],
+                subscription["channel_key"],
             )
 
     return results
@@ -799,8 +945,12 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("check", check_command))
+    application.add_handler(CommandHandler("template", template_command))
     application.add_handler(
         CallbackQueryHandler(select_target_chat, pattern=r"^target_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_template_chat, pattern=r"^template_chat:")
     )
 
     logger.info("Бот уведомлений запущен")
