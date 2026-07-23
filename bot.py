@@ -112,6 +112,7 @@ class Database:
                 preview_file_id TEXT,
                 discord_url TEXT,
                 button_emojis TEXT NOT NULL DEFAULT '{}',
+                button_custom_emoji_ids TEXT NOT NULL DEFAULT '{}',
                 notification_thread_id INTEGER,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
@@ -152,6 +153,7 @@ class Database:
             "preview_file_id": "TEXT",
             "discord_url": "TEXT",
             "button_emojis": "TEXT NOT NULL DEFAULT '{}'",
+            "button_custom_emoji_ids": "TEXT NOT NULL DEFAULT '{}'",
             "notification_thread_id": "INTEGER",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
@@ -289,7 +291,8 @@ class Database:
         return self.connection.execute(
             """
             SELECT notification_template, notification_description, preview_file_id,
-                   discord_url, button_emojis, notification_thread_id, notification_message_id,
+                   discord_url, button_emojis, button_custom_emoji_ids,
+                   notification_thread_id, notification_message_id,
                    notification_has_photo
             FROM chats WHERE chat_id = ?
             """,
@@ -350,6 +353,34 @@ class Database:
         self.connection.execute(
             "UPDATE chats SET button_emojis = ? WHERE chat_id = ?",
             (json.dumps(emojis, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+
+    def get_button_custom_emoji_ids(self, chat_id: int) -> dict[str, str]:
+        row = self.connection.execute(
+            "SELECT button_custom_emoji_ids FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        try:
+            stored = json.loads(row["button_custom_emoji_ids"]) if row else {}
+        except (TypeError, json.JSONDecodeError):
+            stored = {}
+        return {
+            platform: str(custom_emoji_id)
+            for platform, custom_emoji_id in stored.items()
+            if platform in DEFAULT_BUTTON_EMOJIS and custom_emoji_id
+        }
+
+    def set_button_custom_emoji_id(
+        self, chat_id: int, platform: str, custom_emoji_id: str | None
+    ) -> None:
+        custom_emoji_ids = self.get_button_custom_emoji_ids(chat_id)
+        if custom_emoji_id:
+            custom_emoji_ids[platform] = custom_emoji_id
+        else:
+            custom_emoji_ids.pop(platform, None)
+        self.connection.execute(
+            "UPDATE chats SET button_custom_emoji_ids = ? WHERE chat_id = ?",
+            (json.dumps(custom_emoji_ids), chat_id),
         )
         self.connection.commit()
 
@@ -1613,12 +1644,25 @@ async def menu_text_handler(
             )
             return
         database: Database = context.application.bot_data["database"]
-        database.set_button_emoji(
-            context.user_data["emoji_chat_id"],
-            context.user_data["emoji_platform"],
-            emoji,
+        chat_id = context.user_data["emoji_chat_id"]
+        platform_key = context.user_data["emoji_platform"]
+        custom_emoji_id = next(
+            (
+                entity.custom_emoji_id
+                for entity in update.effective_message.entities or ()
+                if getattr(entity.type, "value", entity.type) == "custom_emoji"
+                and entity.custom_emoji_id
+            ),
+            None,
         )
-        platform = context.user_data["emoji_platform"].title()
+        if custom_emoji_id:
+            database.set_button_custom_emoji_id(
+                chat_id, platform_key, custom_emoji_id
+            )
+        else:
+            database.set_button_emoji(chat_id, platform_key, emoji)
+            database.set_button_custom_emoji_id(chat_id, platform_key, None)
+        platform = platform_key.title()
         clear_wizard(context)
         await update.effective_message.reply_text(
             f"Эмодзи для {platform} сохранён.", reply_markup=main_menu()
@@ -1741,6 +1785,27 @@ async def select_description_chat(
     )
 
 
+def link_button(
+    label: str,
+    url: str,
+    emoji: str,
+    custom_emoji_id: str | None,
+) -> InlineKeyboardButton:
+    text = label if custom_emoji_id else f"{emoji} {label}"
+    if custom_emoji_id:
+        try:
+            return InlineKeyboardButton(
+                text,
+                url=url,
+                icon_custom_emoji_id=custom_emoji_id,
+            )
+        except TypeError:
+            logger.warning(
+                "Установлена устаревшая python-telegram-bot без custom emoji в кнопках"
+            )
+    return InlineKeyboardButton(text, url=url)
+
+
 async def select_example_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1764,27 +1829,37 @@ async def select_example_chat(
         settings["notification_description"],
         count_override=1,
     )
+    button_emojis = database.get_button_emojis(chat_id)
+    custom_emoji_ids = database.get_button_custom_emoji_ids(chat_id)
     sample_buttons = [
-        InlineKeyboardButton(
-            f"{database.get_button_emojis(chat_id)['twitch']} Twitch",
-            url="https://www.twitch.tv/",
+        link_button(
+            "Twitch",
+            "https://www.twitch.tv/",
+            button_emojis["twitch"],
+            custom_emoji_ids.get("twitch"),
         ),
-        InlineKeyboardButton(
-            f"{database.get_button_emojis(chat_id)['youtube']} YouTube",
-            url="https://www.youtube.com/",
+        link_button(
+            "YouTube",
+            "https://www.youtube.com/",
+            button_emojis["youtube"],
+            custom_emoji_ids.get("youtube"),
         ),
-        InlineKeyboardButton(
-            f"{database.get_button_emojis(chat_id)['kick']} Kick",
-            url="https://kick.com/",
+        link_button(
+            "Kick",
+            "https://kick.com/",
+            button_emojis["kick"],
+            custom_emoji_ids.get("kick"),
         ),
     ]
     sample_rows = [sample_buttons]
     if settings["discord_url"]:
         sample_rows.append(
             [
-                InlineKeyboardButton(
-                    f"{database.get_button_emojis(chat_id)['discord']} Discord",
-                    url=settings["discord_url"],
+                link_button(
+                    "Discord",
+                    settings["discord_url"],
+                    button_emojis["discord"],
+                    custom_emoji_ids.get("discord"),
                 )
             ]
         )
@@ -1940,7 +2015,7 @@ async def select_emoji_platform(
     context.user_data["emoji_platform"] = platform
     await query.edit_message_text(
         f"Пришли новый эмодзи для кнопки {platform.title()}.\n"
-        "Можно отправить один Unicode-эмодзи, например 🎮."
+        "Можно отправить один Unicode-эмодзи или кастомный эмодзи из Telegram."
     )
 
 
@@ -2035,6 +2110,7 @@ def notification_keyboard(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
     discord_url: str | None,
     button_emojis: dict[str, str],
+    button_custom_emoji_ids: dict[str, str],
 ) -> InlineKeyboardMarkup:
     platform_names = {
         "twitch": ("Twitch", button_emojis["twitch"]),
@@ -2051,17 +2127,31 @@ def notification_keyboard(
     platform_buttons = []
     for subscription, stream in notifications:
         platform, emoji = platform_names[subscription["platform"]]
-        label = f"{emoji} {platform}"
+        label = platform
         if platform_counts[subscription["platform"]] > 1:
             label += f" · {subscription['channel_name']}"
-        platform_buttons.append(InlineKeyboardButton(label, url=stream.url))
+        platform_buttons.append(
+            link_button(
+                label,
+                stream.url,
+                emoji,
+                button_custom_emoji_ids.get(subscription["platform"]),
+            )
+        )
     rows = [
         platform_buttons[index : index + 8]
         for index in range(0, len(platform_buttons), 8)
     ]
     if discord_url:
         rows.append(
-            [InlineKeyboardButton(f"{button_emojis['discord']} Discord", url=discord_url)]
+            [
+                link_button(
+                    "Discord",
+                    discord_url,
+                    button_emojis["discord"],
+                    button_custom_emoji_ids.get("discord"),
+                )
+            ]
         )
     return InlineKeyboardMarkup(rows)
 
@@ -2110,6 +2200,7 @@ async def send_or_edit_notification(
         notifications,
         settings["discord_url"],
         database.get_button_emojis(chat_id),
+        database.get_button_custom_emoji_ids(chat_id),
     )
     message_id = settings["notification_message_id"]
     if message_id:
