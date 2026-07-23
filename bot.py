@@ -40,6 +40,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
+KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
 POLL_INTERVAL_SECONDS = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "120")))
 DB_PATH = Path(os.getenv("DB_PATH", "data/streams.db"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
@@ -48,6 +50,8 @@ TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_STREAMS_URL = "https://api.twitch.tv/helix/streams"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
+KICK_CHANNELS_URL = "https://api.kick.com/public/v1/channels"
 ADMIN_STATUSES = {"creator", "owner", "administrator"}
 MENU_ADD = "➕ Добавить канал"
 MENU_SUBSCRIPTIONS = "📺 Мои подписки"
@@ -79,6 +83,7 @@ class Database:
                 title TEXT NOT NULL,
                 configured_by INTEGER NOT NULL,
                 notification_template TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}',
+                notification_description TEXT NOT NULL DEFAULT '',
                 preview_file_id TEXT,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
@@ -88,7 +93,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
-                platform TEXT NOT NULL CHECK(platform IN ('twitch', 'youtube')),
+                platform TEXT NOT NULL CHECK(platform IN ('twitch', 'youtube', 'kick')),
                 channel_key TEXT NOT NULL,
                 channel_name TEXT NOT NULL,
                 channel_url TEXT NOT NULL,
@@ -115,6 +120,7 @@ class Database:
             "notification_template": (
                 "TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}'"
             ),
+            "notification_description": "TEXT NOT NULL DEFAULT ''",
             "preview_file_id": "TEXT",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
@@ -124,6 +130,41 @@ class Database:
                 self.connection.execute(
                     f"ALTER TABLE chats ADD COLUMN {name} {definition}"
                 )
+        subscriptions_sql = self.connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'subscriptions'
+            """
+        ).fetchone()["sql"]
+        if "'kick'" not in subscriptions_sql:
+            self.connection.execute("ALTER TABLE subscriptions RENAME TO subscriptions_old")
+            self.connection.executescript(
+                """
+                CREATE TABLE subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL
+                        CHECK(platform IN ('twitch', 'youtube', 'kick')),
+                    channel_key TEXT NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    channel_url TEXT NOT NULL,
+                    initialized INTEGER NOT NULL DEFAULT 0,
+                    active_stream_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, platform, channel_key),
+                    FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+                );
+                INSERT INTO subscriptions (
+                    id, chat_id, platform, channel_key, channel_name, channel_url,
+                    initialized, active_stream_id, created_at
+                )
+                SELECT
+                    id, chat_id, platform, channel_key, channel_name, channel_url,
+                    initialized, active_stream_id, created_at
+                FROM subscriptions_old;
+                DROP TABLE subscriptions_old;
+                """
+            )
         self.connection.commit()
 
     def connect_chat(self, chat_id: int, title: str, user_id: int) -> None:
@@ -216,8 +257,8 @@ class Database:
     def get_notification_settings(self, chat_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
             """
-            SELECT notification_template, preview_file_id, notification_message_id,
-                   notification_has_photo
+            SELECT notification_template, notification_description, preview_file_id,
+                   notification_message_id, notification_has_photo
             FROM chats WHERE chat_id = ?
             """,
             (chat_id,),
@@ -227,6 +268,13 @@ class Database:
         self.connection.execute(
             "UPDATE chats SET notification_template = ? WHERE chat_id = ?",
             (template, chat_id),
+        )
+        self.connection.commit()
+
+    def set_notification_description(self, chat_id: int, description: str) -> None:
+        self.connection.execute(
+            "UPDATE chats SET notification_description = ? WHERE chat_id = ?",
+            (description, chat_id),
         )
         self.connection.commit()
 
@@ -336,6 +384,8 @@ class StreamProviders:
         self.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
         self.twitch_access_token: str | None = None
         self.twitch_token_expires_at = 0.0
+        self.kick_access_token: str | None = None
+        self.kick_token_expires_at = 0.0
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -467,6 +517,69 @@ class StreamProviders:
             thumbnail_url=thumbnail,
         )
 
+    async def _kick_token(self) -> str:
+        if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
+            raise RuntimeError("KICK_CLIENT_ID / KICK_CLIENT_SECRET не заданы")
+        if self.kick_access_token and time.time() < self.kick_token_expires_at - 60:
+            return self.kick_access_token
+
+        response = await self.client.post(
+            KICK_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": KICK_CLIENT_ID,
+                "client_secret": KICK_CLIENT_SECRET,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        self.kick_access_token = payload["access_token"]
+        self.kick_token_expires_at = time.time() + int(payload["expires_in"])
+        return self.kick_access_token
+
+    async def kick_channel(self, slug: str) -> tuple[str, str, str]:
+        token = await self._kick_token()
+        response = await self.client.get(
+            KICK_CHANNELS_URL,
+            params={"slug": slug},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        channels = response.json().get("data", [])
+        if not channels:
+            raise ValueError("Канал Kick не найден")
+        channel = channels[0]
+        resolved_slug = channel["slug"]
+        return resolved_slug, resolved_slug, f"https://kick.com/{resolved_slug}"
+
+    async def kick_live(self, slug: str) -> LiveStream | None:
+        token = await self._kick_token()
+        response = await self.client.get(
+            KICK_CHANNELS_URL,
+            params={"slug": slug},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        channels = response.json().get("data", [])
+        if not channels:
+            return None
+
+        channel = channels[0]
+        stream = channel.get("stream") or {}
+        if not stream.get("is_live"):
+            return None
+        stream_id = stream.get("start_time")
+        if not stream_id:
+            raise RuntimeError("Kick API не вернул время начала эфира")
+        category = channel.get("category") or {}
+        return LiveStream(
+            stream_id=str(stream_id),
+            title=channel.get("stream_title") or "Без названия",
+            url=f"https://kick.com/{channel['slug']}",
+            game_name=category.get("name") or None,
+            thumbnail_url=stream.get("thumbnail") or None,
+        )
+
 
 def parse_twitch_url(url: str) -> tuple[str, str, str]:
     parsed = urlparse(url)
@@ -478,6 +591,17 @@ def parse_twitch_url(url: str) -> tuple[str, str, str]:
     if not re.fullmatch(r"[a-z0-9_]{4,25}", login):
         raise ValueError("Не удалось определить канал Twitch из ссылки")
     return login, login, f"https://www.twitch.tv/{login}"
+
+
+def parse_kick_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host != "kick.com":
+        raise ValueError("Нужна ссылка вида https://kick.com/название")
+    slug = parsed.path.strip("/").split("/", 1)[0].lower()
+    if not re.fullmatch(r"[a-z0-9-]{1,25}", slug):
+        raise ValueError("Не удалось определить канал Kick из ссылки")
+    return slug
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -496,6 +620,7 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "wizard",
         "pending_subscription",
         "pending_template",
+        "pending_description",
         "awaiting_preview",
         "pending_preview_file_id",
     ):
@@ -566,7 +691,9 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     providers: StreamProviders = context.application.bot_data["providers"]
 
     if len(context.args) != 2:
-        await message.reply_text("Формат: /add twitch <ссылка> или /add youtube <ссылка>")
+        await message.reply_text(
+            "Формат: /add twitch|youtube|kick <ссылка>"
+        )
         return
 
     platform, url = context.args[0].lower(), context.args[1]
@@ -576,8 +703,12 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             channel_key, channel_name, channel_url = parse_twitch_url(url)
         elif platform == "youtube":
             channel_key, channel_name, channel_url = await providers.youtube_channel_id(url)
+        elif platform == "kick":
+            channel_key, channel_name, channel_url = await providers.kick_channel(
+                parse_kick_url(url)
+            )
         else:
-            raise ValueError("Платформа должна быть twitch или youtube")
+            raise ValueError("Платформа должна быть twitch, youtube или kick")
     except (ValueError, RuntimeError, httpx.HTTPError) as error:
         logger.warning("Не удалось добавить канал: %s", error)
         await message.reply_text(f"Не удалось добавить канал: {error}")
@@ -621,8 +752,12 @@ async def begin_subscription_from_url(
     try:
         if platform == "twitch":
             channel_key, channel_name, channel_url = parse_twitch_url(url)
-        else:
+        elif platform == "youtube":
             channel_key, channel_name, channel_url = await providers.youtube_channel_id(url)
+        else:
+            channel_key, channel_name, channel_url = await providers.kick_channel(
+                parse_kick_url(url)
+            )
     except (ValueError, RuntimeError, httpx.HTTPError) as error:
         await message.reply_text(
             f"Не удалось добавить канал: {error}\nПришли корректную ссылку или нажми «Отмена»."
@@ -873,6 +1008,7 @@ async def show_appearance_menu(
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
+                [InlineKeyboardButton("Изменить описание", callback_data="appearance:description")],
                 [InlineKeyboardButton("Установить картинку", callback_data="appearance:preview")],
                 [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
@@ -908,6 +1044,33 @@ async def choose_template_target(
     )
 
 
+async def choose_description_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, description: str
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+
+    context.user_data["pending_description"] = description
+    context.user_data["wizard"] = "description_target"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"description_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, для которых изменить описание:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -929,6 +1092,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         InlineKeyboardButton("Twitch", callback_data="add:twitch"),
                         InlineKeyboardButton("YouTube", callback_data="add:youtube"),
                     ],
+                    [InlineKeyboardButton("Kick", callback_data="add:kick")],
                     [InlineKeyboardButton("Отмена", callback_data="menu:home")],
                 ]
             ),
@@ -940,7 +1104,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["add_platform"] = platform
         await query.edit_message_text(
             f"Пришли ссылку на канал {platform.title()}.\n"
-            "Например: https://www.twitch.tv/streamer или https://youtube.com/@channel"
+            "Например: https://www.twitch.tv/streamer, https://youtube.com/@channel "
+            "или https://kick.com/streamer"
         )
         return
     if data == "menu:subscriptions":
@@ -1015,6 +1180,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "число новых эфиров."
         )
         return
+    if data == "appearance:description":
+        clear_wizard(context)
+        context.user_data["wizard"] = "description_text"
+        await query.edit_message_text(
+            "Пришли описание для уведомления: правила, ссылки или другую "
+            "информацию. Максимум 350 символов."
+        )
+        return
     if data == "appearance:preview":
         clear_wizard(context)
         context.user_data["awaiting_preview"] = True
@@ -1029,8 +1202,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         for chat in chats:
             settings = database.get_notification_settings(chat["chat_id"])
             preview = "своя картинка" if settings["preview_file_id"] else "автопревью"
+            description = (
+                f"описание: {settings['notification_description']}"
+                if settings["notification_description"]
+                else "без описания"
+            )
             lines.append(
-                f"• {chat['title']}: {settings['notification_template']} ({preview})"
+                f"• {chat['title']}: {settings['notification_template']} "
+                f"({preview}, {description})"
             )
         await query.edit_message_text("\n".join(lines))
 
@@ -1056,6 +1235,7 @@ async def menu_text_handler(
                         InlineKeyboardButton("Twitch", callback_data="add:twitch"),
                         InlineKeyboardButton("YouTube", callback_data="add:youtube"),
                     ],
+                    [InlineKeyboardButton("Kick", callback_data="add:kick")],
                     [InlineKeyboardButton("Отмена", callback_data="menu:home")],
                 ]
             ),
@@ -1087,6 +1267,14 @@ async def menu_text_handler(
             )
             return
         await choose_template_target(update, context, text)
+        return
+    if wizard == "description_text":
+        if len(text) > 350:
+            await update.effective_message.reply_text(
+                "Описание слишком длинное: максимум 350 символов. Пришли другой текст."
+            )
+            return
+        await choose_description_target(update, context, text)
         return
 
     await update.effective_message.reply_text(
@@ -1173,6 +1361,37 @@ async def select_template_chat(
     )
 
 
+async def select_description_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    description = context.user_data.get("pending_description")
+    if description is None or not query.data.startswith("description_chat:"):
+        await query.edit_message_text(
+            "Эта кнопка уже неактуальна. Открой «Оформление» заново."
+        )
+        return
+
+    try:
+        chat_id = int(query.data.removeprefix("description_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    database.set_notification_description(chat_id, description)
+    context.user_data.pop("pending_description", None)
+    context.user_data.pop("wizard", None)
+    await query.edit_message_text(
+        "Описание сохранено. Оно появится в следующем уведомлении."
+    )
+
+
 async def select_preview_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1209,17 +1428,27 @@ async def fetch_live_stream(
         return await providers.twitch_live(subscription["channel_key"])
     if subscription["platform"] == "youtube":
         return await providers.youtube_live(subscription["channel_key"])
+    if subscription["platform"] == "kick":
+        return await providers.kick_live(subscription["channel_key"])
     raise RuntimeError(f"Неизвестная платформа {subscription['platform']}")
 
 
 def format_live_notification(
-    notifications: list[tuple[sqlite3.Row, LiveStream]], template: str
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+    template: str,
+    description: str,
 ) -> str:
     header = html.escape(template.replace("{count}", str(len(notifications))))
     lines = [f"<b>{header}</b>"]
+    if description:
+        lines.append(html.escape(description))
     hidden_count = 0
     for subscription, stream in notifications:
-        platform = "Twitch" if subscription["platform"] == "twitch" else "YouTube"
+        platform = {
+            "twitch": "Twitch",
+            "youtube": "YouTube",
+            "kick": "Kick",
+        }[subscription["platform"]]
         title = html.escape(stream.title[:160] + ("…" if len(stream.title) > 160 else ""))
         details = (
             f"\nКатегория: {html.escape(stream.game_name[:80])}"
@@ -1230,7 +1459,7 @@ def format_live_notification(
             f"• <b>{platform} — {html.escape(subscription['channel_name'])}</b>\n"
             f"<a href=\"{html.escape(stream.url, quote=True)}\">{title}</a>{details}"
         )
-        if len("\n\n".join(lines + [line])) > 950:
+        if len("\n\n".join(lines + [line])) > 1000:
             hidden_count += 1
             continue
         lines.append(line)
@@ -1275,7 +1504,11 @@ async def send_or_edit_notification(
         database.clear_notification_message(chat_id)
         return
 
-    text = format_live_notification(notifications, settings["notification_template"])
+    text = format_live_notification(
+        notifications,
+        settings["notification_template"],
+        settings["notification_description"],
+    )
     message_id = settings["notification_message_id"]
     if message_id:
         try:
@@ -1470,6 +1703,8 @@ def main() -> None:
         logger.warning("Twitch не настроен: добавь TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET")
     if not YOUTUBE_API_KEY:
         logger.warning("YouTube не настроен: добавь YOUTUBE_API_KEY")
+    if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
+        logger.warning("Kick не настроен: добавь KICK_CLIENT_ID и KICK_CLIENT_SECRET")
 
     database = Database(DB_PATH)
     providers = StreamProviders()
@@ -1512,6 +1747,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_template_chat, pattern=r"^template_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_description_chat, pattern=r"^description_chat:")
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
