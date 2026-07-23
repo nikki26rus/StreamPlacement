@@ -48,7 +48,7 @@ FAST_POLL_INTERVAL_SECONDS = max(
     5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "30"))
 )
 YOUTUBE_POLL_INTERVAL_SECONDS = max(
-    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "120"))
+    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "30"))
 )
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
@@ -1124,6 +1124,7 @@ async def show_appearance_menu(
                 [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
                 [InlineKeyboardButton("Изменить описание", callback_data="appearance:description")],
                 [InlineKeyboardButton("Установить картинку", callback_data="appearance:preview")],
+                [InlineKeyboardButton("Показать пример", callback_data="appearance:example")],
                 [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
             ]
@@ -1181,6 +1182,31 @@ async def choose_description_target(
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
     await update.effective_message.reply_text(
         "Выбери канал или группу, для которых изменить описание:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_example_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"example_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери настройки какого канала или группы показать:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -1306,6 +1332,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         clear_wizard(context)
         context.user_data["awaiting_preview"] = True
         await query.edit_message_text("Пришли картинку как фото.")
+        return
+    if data == "appearance:example":
+        await query.edit_message_text("Выбираю настройки для примера.")
+        await choose_example_target(update, context)
         return
     if data == "appearance:status":
         chats = database.list_user_chats(update.effective_user.id)
@@ -1508,6 +1538,61 @@ async def select_description_chat(
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
         "Описание сохранено. Оно появится в следующем уведомлении."
+    )
+
+
+async def select_example_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("example_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Открой «Оформление» заново.")
+        return
+
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    settings = database.get_notification_settings(chat_id)
+    text = format_live_notification(
+        [],
+        settings["notification_template"].replace("{count}", "1"),
+        settings["notification_description"],
+    )
+    sample_keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🟣 Twitch", url="https://www.twitch.tv/")],
+            [InlineKeyboardButton("🔴 YouTube", url="https://www.youtube.com/")],
+            [InlineKeyboardButton("🟢 Kick", url="https://kick.com/")],
+        ]
+    )
+    try:
+        if settings["preview_file_id"]:
+            await context.bot.send_photo(
+                chat_id=update.effective_user.id,
+                photo=settings["preview_file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=sample_keyboard,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=sample_keyboard,
+            )
+    except Exception as error:
+        logger.warning("Не удалось показать пример уведомления: %s", error)
+        await query.edit_message_text(f"Не удалось показать пример: {error}")
+        return
+
+    await query.edit_message_text(
+        "Пример отправлен сюда, в личный чат. Уведомление в канале не публиковалось."
     )
 
 
@@ -1914,6 +1999,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_description_chat, pattern=r"^description_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_example_chat, pattern=r"^example_chat:")
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
