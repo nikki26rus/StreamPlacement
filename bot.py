@@ -45,10 +45,10 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
 FAST_POLL_INTERVAL_SECONDS = max(
-    5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "10"))
+    5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "30"))
 )
 YOUTUBE_POLL_INTERVAL_SECONDS = max(
-    120, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "120"))
+    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "120"))
 )
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
