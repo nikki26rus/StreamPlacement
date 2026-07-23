@@ -10,7 +10,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -44,6 +49,12 @@ TWITCH_STREAMS_URL = "https://api.twitch.tv/helix/streams"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 ADMIN_STATUSES = {"creator", "owner", "administrator"}
+MENU_ADD = "➕ Добавить канал"
+MENU_SUBSCRIPTIONS = "📺 Мои подписки"
+MENU_CHECK = "🔎 Проверить эфиры"
+MENU_APPEARANCE = "🎨 Оформление"
+MENU_HELP = "ℹ️ Помощь"
+MENU_CANCEL = "↩️ Отмена"
 
 
 @dataclass
@@ -469,30 +480,57 @@ def parse_twitch_url(url: str) -> tuple[str, str, str]:
     return login, login, f"https://www.twitch.tv/{login}"
 
 
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [MENU_ADD, MENU_SUBSCRIPTIONS],
+            [MENU_CHECK, MENU_APPEARANCE],
+            [MENU_HELP, MENU_CANCEL],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        "wizard",
+        "pending_subscription",
+        "pending_template",
+        "awaiting_preview",
+        "pending_preview_file_id",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def show_main_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Выбери действие:"
+) -> None:
+    clear_wizard(context)
+    await update.effective_message.reply_text(text, reply_markup=main_menu())
+
+
 def help_text() -> str:
     return (
         "Я сообщаю о начале Twitch и YouTube-эфиров.\n\n"
         "1. Добавь меня администратором в нужный канал или группу. "
         "Ничего писать там не нужно.\n"
-        "2. Открой личку со мной и добавь канал:\n"
-        "/add twitch <ссылка>\n"
-        "/add youtube <ссылка>\n"
-        "3. Выбери канал или группу кнопкой — туда придёт уведомление.\n\n"
-        "В личке доступны:\n"
-        "/chats — подключённые каналы и группы\n"
-        "/list — отслеживаемые каналы\n"
-        "/remove <номер> — удалить канал\n"
-        "/check — проверить свои каналы сейчас\n\n"
-        "/template <текст> — изменить заголовок уведомления для канала или группы\n"
-        "/preview — установить свою картинку для уведомления\n"
-        "В тексте можно использовать {count} — число новых эфиров.\n\n"
+        "2. В личке нажми «Добавить канал» и следуй подсказкам.\n"
+        "3. В «Оформлении» можно изменить заголовок уведомления и установить "
+        "свою картинку.\n\n"
+        "Кнопка «Проверить эфиры» запускает проверку сразу. "
+        "Команды /add, /list, /remove, /check, /template и /preview "
+        "остались доступны как запасной вариант.\n\n"
         "Первый опрос только запоминает текущий статус: уже идущий эфир "
         "не вызовет уведомление. Следующий новый эфир — вызовет."
     )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(help_text())
+    await show_main_menu(
+        update,
+        context,
+        "Добро пожаловать. Я сообщаю о начале Twitch и YouTube-эфиров.",
+    )
 
 
 async def track_connected_chat(
@@ -570,6 +608,83 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ]
     await message.reply_text(
         f"Канал «{channel_name}» добавляется. Выбери чат для уведомлений:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def begin_subscription_from_url(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str, url: str
+) -> None:
+    message = update.effective_message
+    database: Database = context.application.bot_data["database"]
+    providers: StreamProviders = context.application.bot_data["providers"]
+    try:
+        if platform == "twitch":
+            channel_key, channel_name, channel_url = parse_twitch_url(url)
+        else:
+            channel_key, channel_name, channel_url = await providers.youtube_channel_id(url)
+    except (ValueError, RuntimeError, httpx.HTTPError) as error:
+        await message.reply_text(
+            f"Не удалось добавить канал: {error}\nПришли корректную ссылку или нажми «Отмена»."
+        )
+        return
+
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(
+            update,
+            context,
+            "Сначала добавь бота администратором в нужный канал или группу, "
+            "затем повтори добавление.",
+        )
+        return
+
+    context.user_data["pending_subscription"] = {
+        "platform": platform,
+        "channel_key": channel_key,
+        "channel_name": channel_name,
+        "channel_url": channel_url,
+    }
+    context.user_data["wizard"] = "add_target"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"target_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await message.reply_text(
+        f"Канал «{channel_name}» найден. Куда отправлять уведомления?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_subscriptions_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    subscriptions = database.list_user_subscriptions(update.effective_user.id)
+    if not subscriptions:
+        await update.effective_message.reply_text(
+            "Подписок пока нет.", reply_markup=main_menu()
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{subscription['platform'].title()} · {subscription['channel_name']}",
+                callback_data=f"subscription:{subscription['id']}",
+            )
+        ]
+        for subscription in subscriptions
+    ]
+    keyboard.append([InlineKeyboardButton("В меню", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери подписку, чтобы посмотреть её или удалить:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -750,6 +865,235 @@ async def receive_preview_photo(
     )
 
 
+async def show_appearance_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await update.effective_message.reply_text(
+        "Оформление уведомлений:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
+                [InlineKeyboardButton("Установить картинку", callback_data="appearance:preview")],
+                [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
+                [InlineKeyboardButton("В меню", callback_data="menu:home")],
+            ]
+        ),
+    )
+
+
+async def choose_template_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, template: str
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+
+    context.user_data["pending_template"] = template
+    context.user_data["wizard"] = "template_target"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"template_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, для которых изменить заголовок:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    database: Database = context.application.bot_data["database"]
+
+    if data == "menu:home":
+        await query.edit_message_text("Действие отменено.")
+        await show_main_menu(update, context)
+        return
+    if data == "menu:add":
+        clear_wizard(context)
+        context.user_data["wizard"] = "add_platform"
+        await query.edit_message_text(
+            "Выбери платформу:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Twitch", callback_data="add:twitch"),
+                        InlineKeyboardButton("YouTube", callback_data="add:youtube"),
+                    ],
+                    [InlineKeyboardButton("Отмена", callback_data="menu:home")],
+                ]
+            ),
+        )
+        return
+    if data.startswith("add:"):
+        platform = data.removeprefix("add:")
+        context.user_data["wizard"] = "add_url"
+        context.user_data["add_platform"] = platform
+        await query.edit_message_text(
+            f"Пришли ссылку на канал {platform.title()}.\n"
+            "Например: https://www.twitch.tv/streamer или https://youtube.com/@channel"
+        )
+        return
+    if data == "menu:subscriptions":
+        await query.edit_message_text("Список подписок:")
+        await show_subscriptions_menu(update, context)
+        return
+    if data.startswith("subscription:"):
+        subscription_id = int(data.removeprefix("subscription:"))
+        subscriptions = database.list_user_subscriptions(update.effective_user.id)
+        subscription = next(
+            (item for item in subscriptions if item["id"] == subscription_id), None
+        )
+        if not subscription:
+            await query.edit_message_text("Подписка не найдена.")
+            return
+        status = "в эфире" if subscription["active_stream_id"] else "офлайн"
+        await query.edit_message_text(
+            f"{subscription['platform'].title()} · {subscription['channel_name']}\n"
+            f"Получатель: {subscription['chat_title']}\nСтатус: {status}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Удалить", callback_data=f"remove:ask:{subscription_id}"
+                        )
+                    ],
+                    [InlineKeyboardButton("Назад", callback_data="menu:subscriptions")],
+                ]
+            ),
+        )
+        return
+    if data.startswith("remove:ask:"):
+        subscription_id = int(data.removeprefix("remove:ask:"))
+        await query.edit_message_text(
+            "Удалить эту подписку?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Да, удалить", callback_data=f"remove:confirm:{subscription_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "Нет", callback_data=f"subscription:{subscription_id}"
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+    if data.startswith("remove:confirm:"):
+        subscription_id = int(data.removeprefix("remove:confirm:"))
+        removed = database.remove_user_subscription(
+            update.effective_user.id, subscription_id
+        )
+        await query.edit_message_text(
+            "Подписка удалена." if removed else "Подписка уже удалена."
+        )
+        return
+    if data == "menu:check":
+        await query.edit_message_text("Проверяю каналы…")
+        await check_command(update, context)
+        return
+    if data == "menu:appearance":
+        await query.edit_message_text("Открываю настройки оформления.")
+        await show_appearance_menu(update, context)
+        return
+    if data == "appearance:template":
+        clear_wizard(context)
+        context.user_data["wizard"] = "template_text"
+        await query.edit_message_text(
+            "Пришли новый заголовок уведомления. Можно использовать {count} — "
+            "число новых эфиров."
+        )
+        return
+    if data == "appearance:preview":
+        clear_wizard(context)
+        context.user_data["awaiting_preview"] = True
+        await query.edit_message_text("Пришли картинку как фото.")
+        return
+    if data == "appearance:status":
+        chats = database.list_user_chats(update.effective_user.id)
+        if not chats:
+            await query.edit_message_text("Нет доступных каналов или групп.")
+            return
+        lines = ["Текущие настройки:"]
+        for chat in chats:
+            settings = database.get_notification_settings(chat["chat_id"])
+            preview = "своя картинка" if settings["preview_file_id"] else "автопревью"
+            lines.append(
+                f"• {chat['title']}: {settings['notification_template']} ({preview})"
+            )
+        await query.edit_message_text("\n".join(lines))
+
+
+async def menu_text_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if update.effective_chat.type != "private":
+        return
+
+    text = update.effective_message.text.strip()
+    if text == MENU_CANCEL:
+        await show_main_menu(update, context, "Действие отменено.")
+        return
+    if text == MENU_ADD:
+        clear_wizard(context)
+        context.user_data["wizard"] = "add_platform"
+        await update.effective_message.reply_text(
+            "Выбери платформу:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Twitch", callback_data="add:twitch"),
+                        InlineKeyboardButton("YouTube", callback_data="add:youtube"),
+                    ],
+                    [InlineKeyboardButton("Отмена", callback_data="menu:home")],
+                ]
+            ),
+        )
+        return
+    if text == MENU_SUBSCRIPTIONS:
+        await show_subscriptions_menu(update, context)
+        return
+    if text == MENU_CHECK:
+        await check_command(update, context)
+        return
+    if text == MENU_APPEARANCE:
+        await show_appearance_menu(update, context)
+        return
+    if text == MENU_HELP:
+        await update.effective_message.reply_text(help_text(), reply_markup=main_menu())
+        return
+
+    wizard = context.user_data.get("wizard")
+    if wizard == "add_url":
+        await begin_subscription_from_url(
+            update, context, context.user_data["add_platform"], text
+        )
+        return
+    if wizard == "template_text":
+        if len(text) > 300:
+            await update.effective_message.reply_text(
+                "Текст слишком длинный: максимум 300 символов. Пришли другой."
+            )
+            return
+        await choose_template_target(update, context, text)
+        return
+
+    await update.effective_message.reply_text(
+        "Используй кнопки меню ниже.", reply_markup=main_menu()
+    )
+
+
 async def select_target_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -791,6 +1135,8 @@ async def select_target_chat(
         return
 
     context.user_data.pop("pending_subscription", None)
+    context.user_data.pop("wizard", None)
+    context.user_data.pop("add_platform", None)
     await query.edit_message_text(
         f"Готово: #{subscription_id} — {pending['channel_name']}.\n"
         "Первый опрос только запомнит текущий статус эфира."
@@ -820,6 +1166,7 @@ async def select_template_chat(
 
     database.set_notification_template(chat_id, template)
     context.user_data.pop("pending_template", None)
+    context.user_data.pop("wizard", None)
     await query.edit_message_text(
         "Заголовок уведомления сохранён.\n"
         f"Предпросмотр: {template.replace('{count}', '2')}"
@@ -849,6 +1196,7 @@ async def select_preview_chat(
 
     database.set_preview_file_id(chat_id, file_id)
     context.user_data.pop("pending_preview_file_id", None)
+    context.user_data.pop("wizard", None)
     await query.edit_message_text(
         "Картинка сохранена. Она будет использована в следующем уведомлении."
     )
@@ -1154,6 +1502,12 @@ def main() -> None:
     application.add_handler(CommandHandler("preview", preview_command))
     application.add_handler(MessageHandler(filters.PHOTO, receive_preview_photo))
     application.add_handler(
+        CallbackQueryHandler(
+            menu_callback,
+            pattern=r"^(menu|add|subscription|remove|appearance):",
+        )
+    )
+    application.add_handler(
         CallbackQueryHandler(select_target_chat, pattern=r"^target_chat:")
     )
     application.add_handler(
@@ -1161,6 +1515,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler)
     )
 
     logger.info("Бот уведомлений запущен")
