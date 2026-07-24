@@ -624,6 +624,30 @@ class Database:
         )
         self.connection.commit()
 
+    def reset_notification_settings(self, chat_id: int) -> None:
+        """Сбрасывает оформление и параметры уведомлений, не затрагивая подписки."""
+        self.connection.execute(
+            """
+            UPDATE chats
+            SET notification_template = '🔴 Новые эфиры: {count}',
+                notification_description = '',
+                preview_file_id = NULL,
+                discord_url = NULL,
+                button_emojis = '{}',
+                button_custom_emoji_ids = '{}',
+                button_style = '',
+                custom_buttons = '[]',
+                blur_preview = 0,
+                preview_platform = 'auto',
+                notification_thread_id = NULL,
+                notification_message_id = NULL,
+                notification_has_photo = 0
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        self.connection.commit()
+
     def get_chat_subscriptions(self, chat_id: int) -> list[sqlite3.Row]:
         return self.connection.execute(
             "SELECT * FROM subscriptions WHERE chat_id = ? ORDER BY id", (chat_id,)
@@ -1624,6 +1648,12 @@ async def show_appearance_menu(
                         "ℹ️ Настройки", callback_data="appearance:status"
                     ),
                 ],
+                [
+                    InlineKeyboardButton(
+                        "♻️ Сбросить настройки",
+                        callback_data="appearance:reset",
+                    )
+                ],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
             ]
         ),
@@ -1915,6 +1945,31 @@ async def choose_blur_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def choose_reset_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat["title"], callback_data=f"reset_chat:{chat['chat_id']}"
+            )
+        ]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:appearance")])
+    await render_ui(
+        update,
+        context,
+        "Выбери канал или группу. Подписки на стримеров сохранатся.",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -2069,6 +2124,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "appearance:blur":
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_blur_target(update, context)
+        return
+    if data == "appearance:reset":
+        await choose_reset_target(update, context)
         return
     if data == "appearance:example":
         await query.edit_message_text("Выбираю настройки для примера.")
@@ -2922,6 +2980,65 @@ async def toggle_preview_blur(
     )
 
 
+async def ask_reset_notification_settings(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("reset_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    await render_ui(
+        update,
+        context,
+        "Сбросить заголовок, описание, картинку, блюр, источник превью, кнопки, "
+        "эмодзи, цвет и тему форума до заводских значений?\n\n"
+        "Подписки на стримеров не будут удалены.",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Да, сбросить", callback_data=f"reset_confirm:{chat_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "Отмена", callback_data="menu:appearance"
+                    ),
+                ]
+            ]
+        ),
+    )
+
+
+async def reset_notification_settings(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("reset_confirm:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    database.reset_notification_settings(chat_id)
+    clear_wizard(context)
+    await render_ui(
+        update,
+        context,
+        "Настройки уведомлений сброшены до заводских. Подписки сохранены.",
+        main_inline_keyboard(),
+    )
+
+
 async def select_preview_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -3524,6 +3641,16 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(toggle_preview_blur, pattern=r"^blur_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            ask_reset_notification_settings, pattern=r"^reset_chat:"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            reset_notification_settings, pattern=r"^reset_confirm:"
+        )
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
