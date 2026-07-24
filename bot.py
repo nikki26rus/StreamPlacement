@@ -16,9 +16,11 @@ from zoneinfo import ZoneInfo
 import httpx
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.error import BadRequest
@@ -1317,6 +1319,10 @@ def help_text() -> str:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Системное меню команд доступно через кнопку Menu рядом с полем ввода.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     await show_main_menu(
         update,
         context,
@@ -1537,6 +1543,24 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+async def subscriptions_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Раздел доступен в личке с ботом.")
+        return
+    await show_subscriptions_menu(update, context)
+
+
+async def appearance_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Раздел доступен в личке с ботом.")
+        return
+    await show_appearance_menu(update, context)
 
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4024,6 +4048,20 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Главное меню"),
+            BotCommand("add", "Добавить канал"),
+            BotCommand("subscriptions", "Мои подписки"),
+            BotCommand("appearance", "Оформление уведомлений"),
+            BotCommand("check", "Проверить эфиры"),
+            BotCommand("chats", "Подключённые чаты"),
+            BotCommand("list", "Список подписок"),
+            BotCommand("remove", "Удалить подписку"),
+            BotCommand("preview", "Загрузить картинку"),
+            BotCommand("help", "Справка"),
+        ]
+    )
     application.job_queue.run_repeating(
         scheduled_check,
         interval=FAST_POLL_INTERVAL_SECONDS,
@@ -4078,6 +4116,8 @@ def main() -> None:
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("chats", chats_command))
     application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("subscriptions", subscriptions_command))
+    application.add_handler(CommandHandler("appearance", appearance_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("template", template_command))
