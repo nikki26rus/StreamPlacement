@@ -48,10 +48,10 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
 FAST_POLL_INTERVAL_SECONDS = max(
-    5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "30"))
+    5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "90"))
 )
 YOUTUBE_POLL_INTERVAL_SECONDS = max(
-    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "30"))
+    30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "300"))
 )
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
@@ -83,7 +83,6 @@ DEFAULT_BUTTON_EMOJIS = {
     "twitch": "🟣",
     "youtube": "🔴",
     "kick": "🟢",
-    "discord": "💬",
 }
 BUTTON_STYLES = {
     "primary": "Синий",
@@ -125,6 +124,7 @@ class Database:
                 button_style TEXT NOT NULL DEFAULT '',
                 custom_buttons TEXT NOT NULL DEFAULT '[]',
                 blur_preview INTEGER NOT NULL DEFAULT 0,
+                preview_platform TEXT NOT NULL DEFAULT 'auto',
                 notification_thread_id INTEGER,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +169,7 @@ class Database:
             "button_style": "TEXT NOT NULL DEFAULT ''",
             "custom_buttons": "TEXT NOT NULL DEFAULT '[]'",
             "blur_preview": "INTEGER NOT NULL DEFAULT 0",
+            "preview_platform": "TEXT NOT NULL DEFAULT 'auto'",
             "notification_thread_id": "INTEGER",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
@@ -213,6 +214,7 @@ class Database:
                 DROP TABLE subscriptions_old;
                 """
             )
+        self._migrate_discord_buttons()
         self.connection.commit()
 
     def connect_chat(self, chat_id: int, title: str, user_id: int) -> None:
@@ -307,7 +309,7 @@ class Database:
             """
             SELECT notification_template, notification_description, preview_file_id,
                    discord_url, button_emojis, button_custom_emoji_ids,
-                   button_style, custom_buttons, blur_preview,
+                   button_style, custom_buttons, blur_preview, preview_platform,
                    notification_thread_id, notification_message_id,
                    notification_has_photo
             FROM chats WHERE chat_id = ?
@@ -448,6 +450,46 @@ class Database:
         )
         self.connection.commit()
         return True
+
+    def _migrate_discord_buttons(self) -> None:
+        """Переносит старые Discord-кнопки в общий список кастомных кнопок."""
+        rows = self.connection.execute(
+            "SELECT chat_id, discord_url, custom_buttons FROM chats "
+            "WHERE discord_url IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                buttons = json.loads(row["custom_buttons"])
+            except (TypeError, json.JSONDecodeError):
+                buttons = []
+            if not isinstance(buttons, list):
+                buttons = []
+            if not any(
+                isinstance(button, dict) and button.get("url") == row["discord_url"]
+                for button in buttons
+            ):
+                buttons.append({"label": "Discord", "url": row["discord_url"]})
+            self.connection.execute(
+                "UPDATE chats SET custom_buttons = ?, discord_url = NULL "
+                "WHERE chat_id = ?",
+                (json.dumps(buttons, ensure_ascii=False), row["chat_id"]),
+            )
+
+    def get_preview_platform(self, chat_id: int) -> str:
+        row = self.connection.execute(
+            "SELECT preview_platform FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        platform = str(row["preview_platform"]) if row else "auto"
+        return platform if platform in {"auto", "twitch", "youtube", "kick"} else "auto"
+
+    def set_preview_platform(self, chat_id: int, platform: str) -> None:
+        if platform not in {"auto", "twitch", "youtube", "kick"}:
+            raise ValueError("Неизвестная площадка превью")
+        self.connection.execute(
+            "UPDATE chats SET preview_platform = ? WHERE chat_id = ?",
+            (platform, chat_id),
+        )
+        self.connection.commit()
 
     def toggle_preview_blur(self, chat_id: int) -> bool:
         self.connection.execute(
@@ -869,6 +911,28 @@ class StreamProviders:
             return result
         except (httpx.HTTPError, OSError, ValueError) as error:
             logger.warning("Не удалось создать карточку Twitch: %s", error)
+            return None
+
+    async def thumbnail_notification_preview(
+        self, stream: LiveStream, *, blur_background: bool = False
+    ) -> BytesIO | None:
+        """Готовит превью YouTube или Kick с опциональным блюром фона."""
+        if not stream.thumbnail_url:
+            return None
+        try:
+            image = await self._download_image(stream.thumbnail_url)
+            card = ImageOps.fit(image, (1280, 720), method=Image.Resampling.LANCZOS)
+            if blur_background:
+                card = card.filter(ImageFilter.GaussianBlur(radius=18))
+            overlay = Image.new("RGBA", card.size, (0, 0, 0, 85))
+            card = Image.alpha_composite(card.convert("RGBA"), overlay)
+            result = BytesIO()
+            result.name = "stream-preview.jpg"
+            card.convert("RGB").save(result, format="JPEG", quality=90, optimize=True)
+            result.seek(0)
+            return result
+        except (httpx.HTTPError, OSError, ValueError) as error:
+            logger.warning("Не удалось создать карточку превью: %s", error)
             return None
 
 
@@ -1369,16 +1433,17 @@ async def show_appearance_menu(
                 ],
                 [
                     InlineKeyboardButton(
-                        "🌫 Блюр Twitch-превью", callback_data="appearance:blur"
+                    InlineKeyboardButton(
+                        "🖼 Источник превью", callback_data="appearance:preview_source"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "🔗 Кастомные кнопки",
-                        callback_data="appearance:custom_buttons",
+                        "🌫 Блюр превью", callback_data="appearance:blur"
                     ),
                     InlineKeyboardButton(
-                        "💬 Discord", callback_data="appearance:discord"
+                        "🔗 Кастомные кнопки",
+                        callback_data="appearance:custom_buttons",
                     ),
                 ],
                 [
@@ -1581,6 +1646,30 @@ async def choose_preview_clear_target(
     )
 
 
+async def choose_preview_source_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"preview_source_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу для настройки источника превью:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def choose_emoji_target(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1772,6 +1861,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_preview_clear_target(update, context)
         return
+    if data == "appearance:preview_source":
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_preview_source_target(update, context)
+        return
     if data == "appearance:emojis":
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_emoji_target(update, context)
@@ -1792,14 +1885,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Выбираю настройки для примера.")
         await choose_example_target(update, context)
         return
-    if data == "appearance:discord":
-        clear_wizard(context)
-        context.user_data["wizard"] = "discord_text"
-        await query.edit_message_text(
-            "Пришли ссылку-приглашение Discord.\n"
-            "Например: https://discord.gg/название"
-        )
-        return
     if data == "appearance:status":
         chats = database.list_user_chats(update.effective_user.id)
         if not chats:
@@ -1819,13 +1904,18 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if settings["notification_thread_id"]
                 else "общий чат"
             )
-            discord = "Discord подключён" if settings["discord_url"] else "без Discord"
             blur = "блюр Twitch-превью" if settings["blur_preview"] else "без блюра"
             custom_buttons = len(database.get_custom_buttons(chat["chat_id"]))
+            preview_source = {
+                "auto": "автовыбор",
+                "twitch": "Twitch",
+                "youtube": "YouTube",
+                "kick": "Kick",
+            }[settings["preview_platform"]]
             lines.append(
                 f"• {chat['title']}: {settings['notification_template']} "
-                f"({target}, {preview}, {blur}, {description}, {discord}, "
-                f"кастомных кнопок: {custom_buttons})"
+                f"({target}, {preview}, источник: {preview_source}, {blur}, "
+                f"{description}, кастомных кнопок: {custom_buttons})"
             )
         await query.edit_message_text("\n".join(lines))
 
@@ -2215,21 +2305,10 @@ async def select_example_chat(
         sample_buttons[index : index + 2]
         for index in range(0, len(sample_buttons), 2)
     ]
-    extra_sample_buttons = []
-    if settings["discord_url"]:
-        extra_sample_buttons.append(
-            link_button(
-                "Discord",
-                settings["discord_url"],
-                button_emojis["discord"],
-                custom_emoji_ids.get("discord"),
-                button_style,
-            )
-        )
-    extra_sample_buttons.extend(
+    extra_sample_buttons = [
         link_button(button["label"], button["url"], "", None, button_style)
         for button in database.get_custom_buttons(chat_id)
-    )
+    ]
     sample_rows.extend(
         extra_sample_buttons[index : index + 2]
         for index in range(0, len(extra_sample_buttons), 2)
@@ -2284,11 +2363,11 @@ async def select_discord_chat(
         await query.edit_message_text("Нет доступа к этому чату.")
         return
 
-    database.set_discord_url(chat_id, url)
+    database.add_custom_button(chat_id, "Discord", url)
     context.user_data.pop("pending_discord_url", None)
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
-        "Discord-ссылка сохранена. Кнопка появится в следующем уведомлении."
+        "Discord-ссылка сохранена как кастомная кнопка."
     )
 
 
@@ -2313,6 +2392,72 @@ async def select_preview_clear_chat(
         "Своя картинка удалена. В следующем уведомлении будет использовано "
         "автоматическое превью."
     )
+
+
+async def select_preview_source_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("preview_source_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    await query.edit_message_text(
+        "Выбери площадку для автоматического превью. Своя загруженная картинка "
+        "всегда имеет приоритет.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Автовыбор", callback_data=f"preview_platform:{chat_id}:auto"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Twitch", callback_data=f"preview_platform:{chat_id}:twitch"
+                    ),
+                    InlineKeyboardButton(
+                        "YouTube", callback_data=f"preview_platform:{chat_id}:youtube"
+                    ),
+                    InlineKeyboardButton(
+                        "Kick", callback_data=f"preview_platform:{chat_id}:kick"
+                    ),
+                ],
+            ]
+        ),
+    )
+
+
+async def set_preview_platform(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, platform = query.data.split(":", 2)
+        chat_id = int(chat_id_text)
+    except ValueError:
+        await query.edit_message_text("Некорректная настройка. Повтори её.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    try:
+        database.set_preview_platform(chat_id, platform)
+    except ValueError:
+        await query.edit_message_text("Неизвестная площадка.")
+        return
+    label = {"auto": "автовыбор", "twitch": "Twitch", "youtube": "YouTube", "kick": "Kick"}[
+        platform
+    ]
+    await query.edit_message_text(f"Источник автоматического превью: {label}.")
 
 
 async def select_emoji_chat(
@@ -2350,10 +2495,6 @@ async def select_emoji_chat(
                     InlineKeyboardButton(
                         f"{emojis['kick']} Kick",
                         callback_data=f"emoji_platform:{chat_id}:kick",
-                    ),
-                    InlineKeyboardButton(
-                        f"{emojis['discord']} Discord",
-                        callback_data=f"emoji_platform:{chat_id}:discord",
                     ),
                 ],
             ]
@@ -2651,7 +2792,6 @@ def format_live_notification(
 
 def notification_keyboard(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
-    discord_url: str | None,
     button_emojis: dict[str, str],
     button_custom_emoji_ids: dict[str, str],
     button_style: str | None,
@@ -2689,16 +2829,6 @@ def notification_keyboard(
         for index in range(0, len(platform_buttons), 2)
     ]
     extra_buttons = []
-    if discord_url:
-        extra_buttons.append(
-            link_button(
-                "Discord",
-                discord_url,
-                button_emojis["discord"],
-                button_custom_emoji_ids.get("discord"),
-                button_style,
-            )
-        )
     extra_buttons.extend(
         link_button(button["label"], button["url"], "", None, button_style)
         for button in custom_buttons
@@ -2752,7 +2882,6 @@ async def send_or_edit_notification(
     )
     reply_markup = notification_keyboard(
         notifications,
-        settings["discord_url"],
         database.get_button_emojis(chat_id),
         database.get_button_custom_emoji_ids(chat_id),
         settings["button_style"] or None,
@@ -2788,21 +2917,41 @@ async def send_or_edit_notification(
 
     preview = settings["preview_file_id"]
     if not preview:
-        twitch_stream = next(
-            (
-                stream
-                for subscription, stream in notifications
-                if subscription["platform"] == "twitch"
-            ),
-            None,
-        )
-        if twitch_stream:
-            providers: StreamProviders = application.bot_data["providers"]
-            preview = await providers.twitch_notification_preview(
-                twitch_stream, blur_background=bool(settings["blur_preview"])
+        preview_platform = settings["preview_platform"]
+        selected_stream = None
+        if preview_platform == "auto":
+            selected_stream = next(
+                (
+                    (subscription, stream)
+                    for subscription, stream in notifications
+                    if subscription["platform"] == "twitch"
+                ),
+                notifications[0],
             )
+        else:
+            selected_stream = next(
+                (
+                    (subscription, stream)
+                    for subscription, stream in notifications
+                    if subscription["platform"] == preview_platform
+                ),
+                None,
+            )
+        if not selected_stream:
+            selected_stream = notifications[0]
+        if selected_stream:
+            subscription, stream = selected_stream
+            providers: StreamProviders = application.bot_data["providers"]
+            if subscription["platform"] == "twitch":
+                preview = await providers.twitch_notification_preview(
+                    stream, blur_background=bool(settings["blur_preview"])
+                )
+            else:
+                preview = await providers.thumbnail_notification_preview(
+                    stream, blur_background=bool(settings["blur_preview"])
+                )
             if not preview:
-                preview = twitch_stream.thumbnail_url
+                preview = stream.thumbnail_url
         if not preview:
             preview = notifications[0][1].thumbnail_url
     thread_kwargs = (
@@ -3055,6 +3204,14 @@ def main() -> None:
         CallbackQueryHandler(
             select_preview_clear_chat, pattern=r"^clear_preview_chat:"
         )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            select_preview_source_chat, pattern=r"^preview_source_chat:"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(set_preview_platform, pattern=r"^preview_platform:")
     )
     application.add_handler(
         CallbackQueryHandler(select_emoji_chat, pattern=r"^emoji_chat:")
