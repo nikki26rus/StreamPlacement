@@ -176,6 +176,7 @@ class Database:
                 button_style TEXT NOT NULL DEFAULT '',
                 custom_buttons TEXT NOT NULL DEFAULT '[]',
                 platform_button_groups TEXT NOT NULL DEFAULT '{}',
+                subscription_button_groups TEXT NOT NULL DEFAULT '{}',
                 blur_preview INTEGER NOT NULL DEFAULT 0,
                 preview_platform TEXT NOT NULL DEFAULT 'auto',
                 notification_thread_id INTEGER,
@@ -227,6 +228,7 @@ class Database:
             "button_style": "TEXT NOT NULL DEFAULT ''",
             "custom_buttons": "TEXT NOT NULL DEFAULT '[]'",
             "platform_button_groups": "TEXT NOT NULL DEFAULT '{}'",
+            "subscription_button_groups": "TEXT NOT NULL DEFAULT '{}'",
             "blur_preview": "INTEGER NOT NULL DEFAULT 0",
             "preview_platform": "TEXT NOT NULL DEFAULT 'auto'",
             "notification_thread_id": "INTEGER",
@@ -504,6 +506,34 @@ class Database:
         )
         self.connection.commit()
 
+    def get_subscription_button_groups(self, chat_id: int) -> dict[str, int]:
+        row = self.connection.execute(
+            "SELECT subscription_button_groups FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        try:
+            stored = json.loads(row["subscription_button_groups"]) if row else {}
+        except (TypeError, json.JSONDecodeError):
+            stored = {}
+        return {
+            str(subscription_id): int(group)
+            for subscription_id, group in stored.items()
+            if str(group).isdigit() and 1 <= int(group) <= 20
+        }
+
+    def set_subscription_button_group(
+        self, chat_id: int, subscription_id: int, group: int
+    ) -> None:
+        if not 1 <= group <= 20:
+            raise ValueError("Некорректная группа кнопки")
+        groups = self.get_subscription_button_groups(chat_id)
+        groups[str(subscription_id)] = group
+        self.connection.execute(
+            "UPDATE chats SET subscription_button_groups = ? WHERE chat_id = ?",
+            (json.dumps(groups, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+
     def get_custom_buttons(self, chat_id: int) -> list[dict[str, str | int]]:
         row = self.connection.execute(
             "SELECT custom_buttons FROM chats WHERE chat_id = ?", (chat_id,)
@@ -667,6 +697,7 @@ class Database:
                 button_style = '',
                 custom_buttons = '[]',
                 platform_button_groups = '{}',
+                subscription_button_groups = '{}',
                 blur_preview = 0,
                 preview_platform = 'auto',
                 notification_thread_id = NULL,
@@ -1222,6 +1253,7 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "custom_button_index",
         "platform_group_chat_id",
         "platform_group_platform",
+        "platform_group_subscription_id",
         "awaiting_preview",
         "pending_preview_file_id",
     ):
@@ -1674,7 +1706,7 @@ async def show_appearance_menu(
                 ],
                 [
                     InlineKeyboardButton(
-                        "↔️ Группы площадок",
+                        "↔️ Группы каналов",
                         callback_data="appearance:platform_groups",
                     )
                 ],
@@ -2028,7 +2060,7 @@ async def choose_platform_group_target(
     await render_ui(
         update,
         context,
-        "Выбери канал или группу для распределения кнопок площадок:",
+        "Выбери канал или группу для распределения кнопок привязанных каналов:",
         InlineKeyboardMarkup(keyboard),
     )
 
@@ -2466,9 +2498,9 @@ async def menu_text_handler(
             )
             return
         database: Database = context.application.bot_data["database"]
-        database.set_platform_button_group(
+        database.set_subscription_button_group(
             context.user_data["platform_group_chat_id"],
-            context.user_data["platform_group_platform"],
+            context.user_data["platform_group_subscription_id"],
             group,
         )
         clear_wizard(context)
@@ -3096,22 +3128,36 @@ async def select_platform_group_chat(
     if not database.user_can_access_chat(update.effective_user.id, chat_id):
         await query.edit_message_text("Нет доступа к этому чату.")
         return
-    groups = database.get_platform_button_groups(chat_id)
+    subscriptions = database.get_chat_subscriptions(chat_id)
+    if not subscriptions:
+        await render_ui(
+            update,
+            context,
+            "В этом чате пока нет привязанных каналов.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
+            ),
+        )
+        return
+    groups = database.get_subscription_button_groups(chat_id)
+    platform_groups = database.get_platform_button_groups(chat_id)
     keyboard = [
         [
             InlineKeyboardButton(
-                f"{name}: строка {groups[platform]}",
-                callback_data=f"platform_group:{chat_id}:{platform}",
+                f"{PLATFORM_NAMES[subscription['platform']]} · "
+                f"{subscription['channel_name']}: строка "
+                f"{groups.get(str(subscription['id']), platform_groups[subscription['platform']])}",
+                callback_data=f"subscription_group:{chat_id}:{subscription['id']}",
             )
         ]
-        for platform, name in PLATFORM_NAMES.items()
+        for subscription in subscriptions
     ]
     keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
     await render_ui(
         update,
         context,
-        "Выбери кнопку площадки. Одинаковый номер строки объединяет её с "
-        "кнопками других площадок и кастомными кнопками.",
+        "Выбери привязанный канал. Одинаковый номер строки объединяет его "
+        "кнопку с другими каналами и кастомными кнопками.",
         InlineKeyboardMarkup(keyboard),
     )
 
@@ -3122,26 +3168,37 @@ async def begin_platform_group_edit(
     query = update.callback_query
     await query.answer()
     try:
-        _, chat_id_text, platform = query.data.split(":", 2)
-        chat_id = int(chat_id_text)
+        _, chat_id_text, subscription_id_text = query.data.split(":", 2)
+        chat_id, subscription_id = int(chat_id_text), int(subscription_id_text)
     except ValueError:
         await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
         return
     database: Database = context.application.bot_data["database"]
-    if (
-        platform not in PLATFORM_NAMES
-        or not database.user_can_access_chat(update.effective_user.id, chat_id)
-    ):
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
         await query.edit_message_text("Нет доступа к этому чату.")
         return
-    group = database.get_platform_button_groups(chat_id)[platform]
+    subscription = next(
+        (
+            item
+            for item in database.get_chat_subscriptions(chat_id)
+            if item["id"] == subscription_id
+        ),
+        None,
+    )
+    if not subscription:
+        await query.edit_message_text("Этот канал больше не привязан.")
+        return
+    group = database.get_subscription_button_groups(chat_id).get(
+        str(subscription_id),
+        database.get_platform_button_groups(chat_id)[subscription["platform"]],
+    )
     context.user_data["wizard"] = "platform_button_group"
     context.user_data["platform_group_chat_id"] = chat_id
-    context.user_data["platform_group_platform"] = platform
+    context.user_data["platform_group_subscription_id"] = subscription_id
     await render_ui(
         update,
         context,
-        f"Текущая строка {PLATFORM_NAMES[platform]}: {group}.\n"
+        f"Текущая строка {subscription['channel_name']}: {group}.\n"
         "Пришли новый номер строки от 1 до 20.",
         InlineKeyboardMarkup(
             [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
@@ -3385,6 +3442,7 @@ def notification_keyboard(
     button_style: str | None,
     custom_buttons: list[dict[str, str]],
     platform_groups: dict[str, int],
+    subscription_groups: dict[str, int],
 ) -> InlineKeyboardMarkup:
     platform_names = {
         platform: (name, button_emojis[platform])
@@ -3403,7 +3461,10 @@ def notification_keyboard(
         label = platform
         if platform_counts[subscription["platform"]] > 1:
             label += f" · {subscription['channel_name']}"
-        groups.setdefault(platform_groups[subscription["platform"]], []).append(
+        group = subscription_groups.get(
+            str(subscription["id"]), platform_groups[subscription["platform"]]
+        )
+        groups.setdefault(group, []).append(
             link_button(
                 label,
                 subscription["channel_url"],
@@ -3473,6 +3534,7 @@ async def send_or_edit_notification(
         settings["button_style"] or None,
         database.get_custom_buttons(chat_id),
         database.get_platform_button_groups(chat_id),
+        database.get_subscription_button_groups(chat_id),
     )
     message_id = settings["notification_message_id"]
     if message_id:
@@ -3848,7 +3910,7 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(
-            begin_platform_group_edit, pattern=r"^platform_group:"
+            begin_platform_group_edit, pattern=r"^subscription_group:"
         )
     )
     application.add_handler(
