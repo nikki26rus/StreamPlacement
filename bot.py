@@ -21,6 +21,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -44,14 +45,24 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
+STREAM_PROXY_URL = os.getenv("STREAM_PROXY_URL", "").strip()
+INSTAGRAM_COOKIE = os.getenv("INSTAGRAM_COOKIE", "").strip()
+TIKTOK_COOKIE = os.getenv("TIKTOK_COOKIE", "").strip()
+SCRAPE_USER_AGENT = os.getenv(
+    "SCRAPE_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+).strip()
 FAST_POLL_INTERVAL_SECONDS = max(
     5, int(os.getenv("FAST_POLL_INTERVAL_SECONDS", "90"))
 )
 YOUTUBE_POLL_INTERVAL_SECONDS = max(
     30, int(os.getenv("YOUTUBE_POLL_INTERVAL_SECONDS", "300"))
+)
+SLOW_SCRAPE_POLL_INTERVAL_SECONDS = max(
+    60, int(os.getenv("SLOW_SCRAPE_POLL_INTERVAL_SECONDS", "300"))
 )
 COMBINE_DELAY_SECONDS = max(
     0, int(os.getenv("COMBINE_DELAY_SECONDS", "0"))
@@ -83,7 +94,22 @@ DEFAULT_BUTTON_EMOJIS = {
     "twitch": "🟣",
     "youtube": "🔴",
     "kick": "🟢",
+    "vk": "🔵",
+    "rutube": "🟠",
+    "instagram": "🟣",
+    "tiktok": "⚫",
 }
+PLATFORM_NAMES = {
+    "twitch": "Twitch",
+    "youtube": "YouTube",
+    "kick": "Kick",
+    "vk": "VK",
+    "rutube": "Rutube",
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+}
+SCRAPE_PLATFORMS = {"youtube", "vk", "rutube", "instagram", "tiktok"}
+SLOW_SCRAPE_PLATFORMS = {"instagram", "tiktok"}
 BUTTON_STYLES = {
     "primary": "Синий",
     "success": "Зелёный",
@@ -101,6 +127,32 @@ class LiveStream:
     broadcaster_logo_url: str | None = None
     game_box_url: str | None = None
     started_at: str | None = None
+
+
+def parse_public_live_page(platform: str, body: str, url: str) -> LiveStream | None:
+    """Извлекает минимальные данные эфира из публичной HTML/JSON-страницы."""
+    live_patterns = {
+        "vk": r'"(?:is_live|isLive|live)":(?:true|1)',
+        "rutube": r'"(?:is_livestream|isLive|live)":(?:true|1)',
+        "instagram": r'"(?:is_live|isLiveBroadcast|broadcast_status)":"?(?:true|LIVE|live|1)"?',
+        "tiktok": r'"(?:status|is_live|isLive)":(?:"?2"?|true|1)',
+    }
+    if not re.search(live_patterns[platform], body):
+        return None
+    stream_id_match = re.search(
+        r'"(?:room_id|broadcast_id|video_id|live_id|id)":"?([A-Za-z0-9_-]{6,})"?',
+        body,
+    )
+    if not stream_id_match:
+        return None
+    title_match = re.search(r'<meta property="og:title" content="([^"]+)"', body)
+    image_match = re.search(r'<meta property="og:image" content="([^"]+)"', body)
+    return LiveStream(
+        stream_id=stream_id_match.group(1),
+        title=html.unescape(title_match.group(1)) if title_match else "Прямой эфир",
+        url=url,
+        thumbnail_url=html.unescape(image_match.group(1)) if image_match else None,
+    )
 
 
 class Database:
@@ -134,7 +186,12 @@ class Database:
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
-                platform TEXT NOT NULL CHECK(platform IN ('twitch', 'youtube', 'kick')),
+                platform TEXT NOT NULL CHECK(
+                    platform IN (
+                        'twitch', 'youtube', 'kick', 'vk', 'rutube',
+                        'instagram', 'tiktok'
+                    )
+                ),
                 channel_key TEXT NOT NULL,
                 channel_name TEXT NOT NULL,
                 channel_url TEXT NOT NULL,
@@ -185,15 +242,19 @@ class Database:
             WHERE type = 'table' AND name = 'subscriptions'
             """
         ).fetchone()["sql"]
-        if "'kick'" not in subscriptions_sql:
+        if "'tiktok'" not in subscriptions_sql:
             self.connection.execute("ALTER TABLE subscriptions RENAME TO subscriptions_old")
             self.connection.executescript(
                 """
                 CREATE TABLE subscriptions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
-                    platform TEXT NOT NULL
-                        CHECK(platform IN ('twitch', 'youtube', 'kick')),
+                    platform TEXT NOT NULL CHECK(
+                        platform IN (
+                            'twitch', 'youtube', 'kick', 'vk', 'rutube',
+                            'instagram', 'tiktok'
+                        )
+                    ),
                     channel_key TEXT NOT NULL,
                     channel_name TEXT NOT NULL,
                     channel_url TEXT NOT NULL,
@@ -506,10 +567,10 @@ class Database:
             "SELECT preview_platform FROM chats WHERE chat_id = ?", (chat_id,)
         ).fetchone()
         platform = str(row["preview_platform"]) if row else "auto"
-        return platform if platform in {"auto", "twitch", "youtube", "kick"} else "auto"
+        return platform if platform in {"auto", *PLATFORM_NAMES} else "auto"
 
     def set_preview_platform(self, chat_id: int, platform: str) -> None:
-        if platform not in {"auto", "twitch", "youtube", "kick"}:
+        if platform not in {"auto", *PLATFORM_NAMES}:
             raise ValueError("Неизвестная площадка превью")
         self.connection.execute(
             "UPDATE chats SET preview_platform = ? WHERE chat_id = ?",
@@ -636,14 +697,21 @@ class Database:
 class StreamProviders:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+        proxy_kwargs = {"proxy": STREAM_PROXY_URL} if STREAM_PROXY_URL else {}
+        self.scrape_client = httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True,
+            headers={"User-Agent": SCRAPE_USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
+            **proxy_kwargs,
+        )
         self.twitch_access_token: str | None = None
         self.twitch_token_expires_at = 0.0
         self.kick_access_token: str | None = None
         self.kick_token_expires_at = 0.0
-        self.youtube_category_names: dict[str, str] = {}
 
     async def close(self) -> None:
         await self.client.aclose()
+        await self.scrape_client.aclose()
 
     async def _twitch_token(self) -> str:
         if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
@@ -722,116 +790,79 @@ class StreamProviders:
         )
 
     async def youtube_channel_id(self, url: str) -> tuple[str, str, str]:
-        if not YOUTUBE_API_KEY:
-            raise RuntimeError("YOUTUBE_API_KEY не задан")
-
         parsed = urlparse(url)
         host = parsed.netloc.lower().removeprefix("www.")
-        if host not in {"youtube.com", "m.youtube.com", "youtu.be"}:
+        if host not in {"youtube.com", "m.youtube.com"}:
             raise ValueError("Нужна ссылка на канал YouTube")
 
         path = parsed.path.strip("/")
-        channel_id = None
-        handle = None
+        channel_id = ""
         if path.startswith("channel/"):
-            channel_id = path.split("/", 1)[1]
+            channel_id = path.split("/", 1)[1].split("/", 1)[0]
         elif path.startswith("@"):
-            handle = path.split("/", 1)[0]
+            response = await self.scrape_client.get(f"https://www.youtube.com/{path.split('/', 1)[0]}")
+            response.raise_for_status()
+            match = re.search(r'"externalId":"(UC[\w-]+)"', response.text)
+            if not match:
+                raise ValueError("Не удалось определить ID канала YouTube")
+            channel_id = match.group(1)
         else:
             raise ValueError(
                 "Поддерживаются ссылки вида youtube.com/channel/UC... "
                 "или youtube.com/@название"
             )
-
-        params = {"part": "snippet", "key": YOUTUBE_API_KEY}
-        if channel_id:
-            params["id"] = channel_id
-        else:
-            params["forHandle"] = handle
-
-        response = await self.client.get(YOUTUBE_CHANNELS_URL, params=params)
+        response = await self.scrape_client.get(
+            f"https://www.youtube.com/channel/{channel_id}"
+        )
         response.raise_for_status()
-        channels = response.json().get("items", [])
-        if not channels:
-            raise ValueError("Канал YouTube не найден")
-
-        channel = channels[0]
-        resolved_id = channel["id"]
-        title = channel["snippet"]["title"]
-        return resolved_id, title, f"https://www.youtube.com/channel/{resolved_id}"
+        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', response.text)
+        title = html.unescape(title_match.group(1)) if title_match else channel_id
+        return channel_id, title, f"https://www.youtube.com/channel/{channel_id}"
 
     async def youtube_live(self, channel_id: str) -> LiveStream | None:
-        if not YOUTUBE_API_KEY:
-            raise RuntimeError("YOUTUBE_API_KEY не задан")
-
-        response = await self.client.get(
-            YOUTUBE_SEARCH_URL,
-            params={
-                "part": "snippet",
-                "channelId": channel_id,
-                "eventType": "live",
-                "type": "video",
-                "maxResults": 1,
-                "key": YOUTUBE_API_KEY,
-            },
+        response = await self.scrape_client.get(
+            f"https://www.youtube.com/channel/{channel_id}/live"
         )
         response.raise_for_status()
-        items = response.json().get("items", [])
-        if not items:
+        canonical = re.search(
+            r'<link rel="canonical" href="https?://www\.youtube\.com/watch\?v=([^"&]+)',
+            response.text,
+        )
+        if not canonical or '"isLiveContent":true' not in response.text:
             return None
-
-        item = items[0]
-        video_id = item["id"]["videoId"]
-        snippet = item["snippet"]
-        thumbnails = snippet.get("thumbnails", {})
-        thumbnail = (
-            thumbnails.get("high")
-            or thumbnails.get("medium")
-            or thumbnails.get("default")
-            or {}
-        ).get("url")
-        video_response = await self.client.get(
-            YOUTUBE_VIDEOS_URL,
-            params={"part": "snippet", "id": video_id, "key": YOUTUBE_API_KEY},
-        )
-        video_response.raise_for_status()
-        video_snippet = (
-            (video_response.json().get("items") or [{}])[0].get("snippet") or {}
-        )
-        category_name = await self._youtube_category_name(
-            video_snippet.get("categoryId") or ""
-        )
+        video_id = canonical.group(1)
+        title_match = re.search(r'"title":"([^"]+)"', response.text)
+        thumbnail_match = re.search(r'"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)', response.text)
         return LiveStream(
             stream_id=video_id,
-            title=snippet.get("title") or "Без названия",
+            title=html.unescape(title_match.group(1)) if title_match else "Без названия",
             url=f"https://www.youtube.com/watch?v={video_id}",
-            thumbnail_url=thumbnail,
-            started_at=snippet.get("publishedAt") or None,
-            game_name=category_name,
+            thumbnail_url=thumbnail_match.group(1).replace(r"\u0026", "&") if thumbnail_match else None,
         )
 
-    async def _youtube_category_name(self, category_id: str) -> str | None:
-        if not category_id:
-            return None
-        if category_id in self.youtube_category_names:
-            return self.youtube_category_names[category_id]
-        response = await self.client.get(
-            YOUTUBE_VIDEO_CATEGORIES_URL,
-            params={
-                "part": "snippet",
-                "id": category_id,
-                "regionCode": "RU",
-                "key": YOUTUBE_API_KEY,
-            },
-        )
+    async def public_channel(self, platform: str, key: str) -> tuple[str, str, str]:
+        url = public_channel_url(platform, key)
+        headers = {}
+        if platform == "instagram" and INSTAGRAM_COOKIE:
+            headers["Cookie"] = INSTAGRAM_COOKIE
+        if platform == "tiktok" and TIKTOK_COOKIE:
+            headers["Cookie"] = TIKTOK_COOKIE
+        response = await self.scrape_client.get(url, headers=headers)
         response.raise_for_status()
-        categories = response.json().get("items", [])
-        if not categories:
-            return None
-        name = categories[0]["snippet"].get("title")
-        if name:
-            self.youtube_category_names[category_id] = name
-        return name or None
+        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', response.text)
+        name = html.unescape(title_match.group(1)) if title_match else key
+        return key, name, url
+
+    async def public_live(self, platform: str, key: str) -> LiveStream | None:
+        url = public_channel_url(platform, key, live=True)
+        headers = {}
+        if platform == "instagram" and INSTAGRAM_COOKIE:
+            headers["Cookie"] = INSTAGRAM_COOKIE
+        if platform == "tiktok" and TIKTOK_COOKIE:
+            headers["Cookie"] = TIKTOK_COOKIE
+        response = await self.scrape_client.get(url, headers=headers)
+        response.raise_for_status()
+        return parse_public_live_page(platform, response.text, str(response.url))
 
     async def _kick_token(self) -> str:
         if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
@@ -985,6 +1016,39 @@ def parse_kick_url(url: str) -> str:
     return slug
 
 
+def parse_public_platform_url(platform: str, url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.strip("/")
+    hosts = {
+        "vk": {"vk.com", "vkvideo.ru"},
+        "rutube": {"rutube.ru"},
+        "instagram": {"instagram.com"},
+        "tiktok": {"tiktok.com"},
+    }
+    if platform not in hosts or host not in hosts[platform]:
+        raise ValueError(f"Нужна ссылка на канал {PLATFORM_NAMES[platform]}")
+    if platform == "tiktok":
+        key = path.removeprefix("@").split("/", 1)[0]
+    elif platform == "rutube" and path.startswith("channel/"):
+        key = path.split("/", 2)[1]
+    else:
+        key = path.split("/", 1)[0].removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", key):
+        raise ValueError("Не удалось определить канал по ссылке")
+    return key.lower()
+
+
+def public_channel_url(platform: str, key: str, *, live: bool = False) -> str:
+    base = {
+        "vk": f"https://vk.com/{key}",
+        "rutube": f"https://rutube.ru/channel/{key}/",
+        "instagram": f"https://www.instagram.com/{key}/",
+        "tiktok": f"https://www.tiktok.com/@{key}",
+    }[platform]
+    return f"{base.rstrip('/')}/live/" if live and platform in {"instagram", "tiktok"} else base
+
+
 def parse_discord_url(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.")
@@ -1001,6 +1065,22 @@ def parse_discord_url(url: str) -> str:
     return url
 
 
+async def resolve_channel(
+    providers: StreamProviders, platform: str, url: str
+) -> tuple[str, str, str]:
+    if platform == "twitch":
+        return parse_twitch_url(url)
+    if platform == "youtube":
+        return await providers.youtube_channel_id(url)
+    if platform == "kick":
+        return await providers.kick_channel(parse_kick_url(url))
+    if platform in {"vk", "rutube", "instagram", "tiktok"}:
+        return await providers.public_channel(
+            platform, parse_public_platform_url(platform, url)
+        )
+    raise ValueError(f"Неизвестная платформа: {platform}")
+
+
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -1010,6 +1090,65 @@ def main_menu() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def main_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ Добавить канал", callback_data="menu:add"),
+                InlineKeyboardButton("📺 Подписки", callback_data="menu:subscriptions"),
+            ],
+            [
+                InlineKeyboardButton("🔎 Проверить", callback_data="menu:check"),
+                InlineKeyboardButton("🎨 Оформление", callback_data="menu:appearance"),
+            ],
+            [InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help")],
+        ]
+    )
+
+
+async def render_ui(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Обновляет единый экран навигации в личном чате."""
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(text, reply_markup=reply_markup)
+        return
+    query = update.callback_query
+    if query and query.message:
+        context.user_data["ui_message_id"] = query.message.message_id
+        try:
+            await query.edit_message_text(
+                text, reply_markup=reply_markup, disable_web_page_preview=True
+            )
+            return
+        except BadRequest as error:
+            if "Message is not modified" in str(error):
+                return
+    message_id = context.user_data.get("ui_message_id")
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest:
+            context.user_data.pop("ui_message_id", None)
+    message = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+    context.user_data["ui_message_id"] = message.message_id
 
 
 def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1037,7 +1176,7 @@ async def show_main_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Выбери действие:"
 ) -> None:
     clear_wizard(context)
-    await update.effective_message.reply_text(text, reply_markup=main_menu())
+    await render_ui(update, context, text, main_inline_keyboard())
 
 
 def help_text() -> str:
@@ -1126,23 +1265,16 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if len(context.args) != 2:
         await message.reply_text(
-            "Формат: /add twitch|youtube|kick <ссылка>"
+            "Формат: /add twitch|youtube|kick|vk|rutube|instagram|tiktok <ссылка>"
         )
         return
 
     platform, url = context.args[0].lower(), context.args[1]
     platform = {"twich": "twitch"}.get(platform, platform)
     try:
-        if platform == "twitch":
-            channel_key, channel_name, channel_url = parse_twitch_url(url)
-        elif platform == "youtube":
-            channel_key, channel_name, channel_url = await providers.youtube_channel_id(url)
-        elif platform == "kick":
-            channel_key, channel_name, channel_url = await providers.kick_channel(
-                parse_kick_url(url)
-            )
-        else:
-            raise ValueError("Платформа должна быть twitch, youtube или kick")
+        channel_key, channel_name, channel_url = await resolve_channel(
+            providers, platform, url
+        )
     except (ValueError, RuntimeError, httpx.HTTPError) as error:
         logger.warning("Не удалось добавить канал: %s", error)
         await message.reply_text(f"Не удалось добавить канал: {error}")
@@ -1184,17 +1316,14 @@ async def begin_subscription_from_url(
     database: Database = context.application.bot_data["database"]
     providers: StreamProviders = context.application.bot_data["providers"]
     try:
-        if platform == "twitch":
-            channel_key, channel_name, channel_url = parse_twitch_url(url)
-        elif platform == "youtube":
-            channel_key, channel_name, channel_url = await providers.youtube_channel_id(url)
-        else:
-            channel_key, channel_name, channel_url = await providers.kick_channel(
-                parse_kick_url(url)
-            )
+        channel_key, channel_name, channel_url = await resolve_channel(
+            providers, platform, url
+        )
     except (ValueError, RuntimeError, httpx.HTTPError) as error:
-        await message.reply_text(
-            f"Не удалось добавить канал: {error}\nПришли корректную ссылку или нажми «Отмена»."
+        await render_ui(
+            update,
+            context,
+            f"Не удалось добавить канал: {error}\nПришли корректную ссылку или нажми «Отмена».",
         )
         return
 
@@ -1225,9 +1354,11 @@ async def begin_subscription_from_url(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await message.reply_text(
+    await render_ui(
+        update,
+        context,
         f"Канал «{channel_name}» найден. Куда отправлять уведомления?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1237,9 +1368,7 @@ async def show_subscriptions_menu(
     database: Database = context.application.bot_data["database"]
     subscriptions = database.list_user_subscriptions(update.effective_user.id)
     if not subscriptions:
-        await update.effective_message.reply_text(
-            "Подписок пока нет.", reply_markup=main_menu()
-        )
+        await render_ui(update, context, "Подписок пока нет.", main_inline_keyboard())
         return
 
     keyboard = [
@@ -1252,9 +1381,11 @@ async def show_subscriptions_menu(
         for subscription in subscriptions
     ]
     keyboard.append([InlineKeyboardButton("В меню", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update,
+        context,
         "Выбери подписку, чтобы посмотреть её или удалить:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1311,17 +1442,19 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     database: Database = context.application.bot_data["database"]
     subscriptions = database.list_user_subscriptions(update.effective_user.id)
     if not subscriptions:
-        await update.effective_message.reply_text("У тебя нет доступных подписок.")
+        await render_ui(update, context, "У тебя нет доступных подписок.", main_inline_keyboard())
         return
 
-    await update.effective_message.reply_text("Проверяю каналы…")
+    await render_ui(update, context, "Проверяю каналы…")
     results = await check_streams(
         context.application,
         only_subscription_ids={subscription["id"] for subscription in subscriptions},
     )
-    await update.effective_message.reply_text(
+    await render_ui(
+        update,
+        context,
         "Результат проверки:\n" + "\n".join(results),
-        disable_web_page_preview=True,
+        main_inline_keyboard(),
     )
 
 
@@ -1439,9 +1572,11 @@ async def receive_preview_photo(
 async def show_appearance_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    await update.effective_message.reply_text(
+    await render_ui(
+        update,
+        context,
         "Оформление уведомлений:",
-        reply_markup=InlineKeyboardMarkup(
+        InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
@@ -1516,9 +1651,10 @@ async def choose_template_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, для которых изменить заголовок:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1539,9 +1675,10 @@ async def choose_template_edit_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, где изменить заголовок:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1566,9 +1703,10 @@ async def choose_description_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, для которых изменить описание:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1590,9 +1728,10 @@ async def choose_description_edit_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, где изменить описание:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1615,9 +1754,10 @@ async def choose_example_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери настройки какого канала или группы показать:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1642,9 +1782,10 @@ async def choose_discord_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу для Discord-кнопки:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1667,9 +1808,10 @@ async def choose_preview_clear_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, где удалить свою картинку:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1691,9 +1833,10 @@ async def choose_preview_source_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу для настройки источника превью:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1716,9 +1859,10 @@ async def choose_emoji_target(
         for chat_row in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, для которых изменить эмодзи:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1732,9 +1876,10 @@ async def choose_custom_button_target(
         for chat in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу для кастомных кнопок:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1748,9 +1893,10 @@ async def choose_button_color_target(
         for chat in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу для цвета кнопок:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1762,9 +1908,10 @@ async def choose_blur_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for chat in chats
     ]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
-    await update.effective_message.reply_text(
+    await render_ui(
+        update, context,
         "Выбери канал или группу, где включить или выключить блюр:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -1775,8 +1922,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     database: Database = context.application.bot_data["database"]
 
     if data == "menu:home":
-        await query.edit_message_text("Действие отменено.")
         await show_main_menu(update, context)
+        return
+    if data == "menu:help":
+        await render_ui(
+            update,
+            context,
+            help_text(),
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("В меню", callback_data="menu:home")]]
+            ),
+        )
         return
     if data == "menu:add":
         clear_wizard(context)
@@ -1789,7 +1945,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         InlineKeyboardButton("Twitch", callback_data="add:twitch"),
                         InlineKeyboardButton("YouTube", callback_data="add:youtube"),
                     ],
-                    [InlineKeyboardButton("Kick", callback_data="add:kick")],
+                    [
+                        InlineKeyboardButton("Kick", callback_data="add:kick"),
+                        InlineKeyboardButton("VK", callback_data="add:vk"),
+                    ],
+                    [
+                        InlineKeyboardButton("Rutube", callback_data="add:rutube"),
+                        InlineKeyboardButton("Instagram", callback_data="add:instagram"),
+                    ],
+                    [InlineKeyboardButton("TikTok", callback_data="add:tiktok")],
                     [InlineKeyboardButton("Отмена", callback_data="menu:home")],
                 ]
             ),
@@ -1802,11 +1966,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text(
             f"Пришли ссылку на канал {platform.title()}.\n"
             "Например: https://www.twitch.tv/streamer, https://youtube.com/@channel "
-            "или https://kick.com/streamer"
+            "или ссылку на канал выбранной площадки."
         )
         return
     if data == "menu:subscriptions":
-        await query.edit_message_text("Список подписок:")
         await show_subscriptions_menu(update, context)
         return
     if data.startswith("subscription:"):
@@ -1866,7 +2029,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await check_command(update, context)
         return
     if data == "menu:appearance":
-        await query.edit_message_text("Открываю настройки оформления.")
         await show_appearance_menu(update, context)
         return
     if data == "appearance:template":
@@ -1968,7 +2130,15 @@ async def menu_text_handler(
                         InlineKeyboardButton("Twitch", callback_data="add:twitch"),
                         InlineKeyboardButton("YouTube", callback_data="add:youtube"),
                     ],
-                    [InlineKeyboardButton("Kick", callback_data="add:kick")],
+                    [
+                        InlineKeyboardButton("Kick", callback_data="add:kick"),
+                        InlineKeyboardButton("VK", callback_data="add:vk"),
+                    ],
+                    [
+                        InlineKeyboardButton("Rutube", callback_data="add:rutube"),
+                        InlineKeyboardButton("Instagram", callback_data="add:instagram"),
+                    ],
+                    [InlineKeyboardButton("TikTok", callback_data="add:tiktok")],
                     [InlineKeyboardButton("Отмена", callback_data="menu:home")],
                 ]
             ),
@@ -2350,26 +2520,21 @@ async def select_example_chat(
     button_style = database.get_button_style(chat_id)
     sample_buttons = [
         link_button(
-            "Twitch",
-            "https://www.twitch.tv/",
-            button_emojis["twitch"],
-            custom_emoji_ids.get("twitch"),
+            name,
+            {
+                "twitch": "https://www.twitch.tv/",
+                "youtube": "https://www.youtube.com/",
+                "kick": "https://kick.com/",
+                "vk": "https://vk.com/",
+                "rutube": "https://rutube.ru/",
+                "instagram": "https://instagram.com/",
+                "tiktok": "https://tiktok.com/",
+            }[platform],
+            button_emojis[platform],
+            custom_emoji_ids.get(platform),
             button_style,
-        ),
-        link_button(
-            "YouTube",
-            "https://www.youtube.com/",
-            button_emojis["youtube"],
-            custom_emoji_ids.get("youtube"),
-            button_style,
-        ),
-        link_button(
-            "Kick",
-            "https://kick.com/",
-            button_emojis["kick"],
-            custom_emoji_ids.get("kick"),
-            button_style,
-        ),
+        )
+        for platform, name in PLATFORM_NAMES.items()
     ]
     sample_rows = [
         sample_buttons[index : index + 2]
@@ -2480,23 +2645,15 @@ async def select_preview_source_chat(
         "Выбери площадку для автоматического превью. Своя загруженная картинка "
         "всегда имеет приоритет.",
         reply_markup=InlineKeyboardMarkup(
-            [
+            [[InlineKeyboardButton("Автовыбор", callback_data=f"preview_platform:{chat_id}:auto")]]
+            + [
                 [
                     InlineKeyboardButton(
-                        "Автовыбор", callback_data=f"preview_platform:{chat_id}:auto"
+                        name, callback_data=f"preview_platform:{chat_id}:{platform}"
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Twitch", callback_data=f"preview_platform:{chat_id}:twitch"
-                    ),
-                    InlineKeyboardButton(
-                        "YouTube", callback_data=f"preview_platform:{chat_id}:youtube"
-                    ),
-                    InlineKeyboardButton(
-                        "Kick", callback_data=f"preview_platform:{chat_id}:kick"
-                    ),
-                ],
+                    for platform, name in list(PLATFORM_NAMES.items())[index : index + 2]
+                ]
+                for index in range(0, len(PLATFORM_NAMES), 2)
             ]
         ),
     )
@@ -2522,9 +2679,7 @@ async def set_preview_platform(
     except ValueError:
         await query.edit_message_text("Неизвестная площадка.")
         return
-    label = {"auto": "автовыбор", "twitch": "Twitch", "youtube": "YouTube", "kick": "Kick"}[
-        platform
-    ]
+    label = "автовыбор" if platform == "auto" else PLATFORM_NAMES[platform]
     await query.edit_message_text(f"Источник автоматического превью: {label}.")
 
 
@@ -2551,20 +2706,12 @@ async def select_emoji_chat(
             [
                 [
                     InlineKeyboardButton(
-                        f"{emojis['twitch']} Twitch",
-                        callback_data=f"emoji_platform:{chat_id}:twitch",
-                    ),
-                    InlineKeyboardButton(
-                        f"{emojis['youtube']} YouTube",
-                        callback_data=f"emoji_platform:{chat_id}:youtube",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"{emojis['kick']} Kick",
-                        callback_data=f"emoji_platform:{chat_id}:kick",
-                    ),
-                ],
+                        f"{emojis[platform]} {name}",
+                        callback_data=f"emoji_platform:{chat_id}:{platform}",
+                    )
+                    for platform, name in list(PLATFORM_NAMES.items())[index : index + 2]
+                ]
+                for index in range(0, len(PLATFORM_NAMES), 2)
             ]
         ),
     )
@@ -2813,6 +2960,10 @@ async def fetch_live_stream(
         return await providers.youtube_live(subscription["channel_key"])
     if subscription["platform"] == "kick":
         return await providers.kick_live(subscription["channel_key"])
+    if subscription["platform"] in {"vk", "rutube", "instagram", "tiktok"}:
+        return await providers.public_live(
+            subscription["platform"], subscription["channel_key"]
+        )
     raise RuntimeError(f"Неизвестная платформа {subscription['platform']}")
 
 
@@ -2868,6 +3019,10 @@ def format_live_notification(
         "{titleTwich}": notification_platform_value(notifications, "twitch", "title"),
         "{titleTwitch}": notification_platform_value(notifications, "twitch", "title"),
         "{titleKick}": notification_platform_value(notifications, "kick", "title"),
+        "{titleVK}": notification_platform_value(notifications, "vk", "title"),
+        "{titleRutube}": notification_platform_value(notifications, "rutube", "title"),
+        "{titleInstagram}": notification_platform_value(notifications, "instagram", "title"),
+        "{titleTikTok}": notification_platform_value(notifications, "tiktok", "title"),
         "{categoryYT}": notification_platform_value(
             notifications, "youtube", "game_name"
         ),
@@ -2880,6 +3035,10 @@ def format_live_notification(
         "{categoryKick}": notification_platform_value(
             notifications, "kick", "game_name"
         ),
+        "{categoryVK}": notification_platform_value(notifications, "vk", "game_name"),
+        "{categoryRutube}": notification_platform_value(notifications, "rutube", "game_name"),
+        "{categoryInstagram}": notification_platform_value(notifications, "instagram", "game_name"),
+        "{categoryTikTok}": notification_platform_value(notifications, "tiktok", "game_name"),
     }
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
@@ -2916,9 +3075,8 @@ def notification_keyboard(
     custom_buttons: list[dict[str, str]],
 ) -> InlineKeyboardMarkup:
     platform_names = {
-        "twitch": ("Twitch", button_emojis["twitch"]),
-        "youtube": ("YouTube", button_emojis["youtube"]),
-        "kick": ("Kick", button_emojis["kick"]),
+        platform: (name, button_emojis[platform])
+        for platform, name in PLATFORM_NAMES.items()
     }
     platform_counts = {
         platform: sum(
@@ -3121,10 +3279,15 @@ async def check_streams(
     results = []
     started_chats: set[int] = set()
     changed_chats: set[int] = set()
-    check_youtube = (
+    check_scrape = (
         only_subscription_ids is not None
-        or time.monotonic() - application.bot_data["last_youtube_check"]
+        or time.monotonic() - application.bot_data["last_scrape_check"]
         >= YOUTUBE_POLL_INTERVAL_SECONDS
+    )
+    check_slow_scrape = (
+        only_subscription_ids is not None
+        or time.monotonic() - application.bot_data["last_slow_scrape_check"]
+        >= SLOW_SCRAPE_POLL_INTERVAL_SECONDS
     )
 
     for subscription in subscriptions:
@@ -3133,7 +3296,15 @@ async def check_streams(
             and subscription["id"] not in only_subscription_ids
         ):
             continue
-        if subscription["platform"] == "youtube" and not check_youtube:
+        if (
+            subscription["platform"] in SLOW_SCRAPE_PLATFORMS
+            and not check_slow_scrape
+        ):
+            continue
+        if (
+            subscription["platform"] in SCRAPE_PLATFORMS - SLOW_SCRAPE_PLATFORMS
+            and not check_scrape
+        ):
             continue
 
         try:
@@ -3160,7 +3331,7 @@ async def check_streams(
         else:
             results.append(
                 f"⚪ #{subscription['id']} {subscription['platform']} "
-                f"{subscription['channel_name']}: API не нашёл активный эфир"
+                f"{subscription['channel_name']}: активный эфир не найден"
             )
 
         if not subscription["initialized"]:
@@ -3193,8 +3364,10 @@ async def check_streams(
             )
             changed_chats.add(subscription["chat_id"])
 
-    if check_youtube:
-        application.bot_data["last_youtube_check"] = time.monotonic()
+    if check_scrape:
+        application.bot_data["last_scrape_check"] = time.monotonic()
+    if check_slow_scrape:
+        application.bot_data["last_slow_scrape_check"] = time.monotonic()
 
     pending_chats: set[int] = application.bot_data["pending_notification_chats"]
     for chat_id in started_chats:
@@ -3236,9 +3409,10 @@ async def post_init(application: Application) -> None:
         name="stream-status-check",
     )
     logger.info(
-        "Проверка Twitch/Kick каждые %d секунд, YouTube каждые %d секунд",
+        "Проверка Twitch/Kick каждые %d секунд, публичных источников каждые %d/%d секунд",
         FAST_POLL_INTERVAL_SECONDS,
         YOUTUBE_POLL_INTERVAL_SECONDS,
+        SLOW_SCRAPE_POLL_INTERVAL_SECONDS,
     )
 
 
@@ -3252,8 +3426,6 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN не задан")
     if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
         logger.warning("Twitch не настроен: добавь TWITCH_CLIENT_ID и TWITCH_CLIENT_SECRET")
-    if not YOUTUBE_API_KEY:
-        logger.warning("YouTube не настроен: добавь YOUTUBE_API_KEY")
     if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
         logger.warning("Kick не настроен: добавь KICK_CLIENT_ID и KICK_CLIENT_SECRET")
 
@@ -3269,7 +3441,8 @@ def main() -> None:
     application.bot_data["database"] = database
     application.bot_data["providers"] = providers
     application.bot_data["pending_notification_chats"] = set()
-    application.bot_data["last_youtube_check"] = 0.0
+    application.bot_data["last_scrape_check"] = 0.0
+    application.bot_data["last_slow_scrape_check"] = 0.0
 
     application.add_error_handler(on_error)
     application.add_handler(
