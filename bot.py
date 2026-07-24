@@ -179,6 +179,7 @@ class Database:
                 custom_buttons TEXT NOT NULL DEFAULT '[]',
                 platform_button_groups TEXT NOT NULL DEFAULT '{}',
                 subscription_button_groups TEXT NOT NULL DEFAULT '{}',
+                subscription_button_labels TEXT NOT NULL DEFAULT '{}',
                 blur_preview INTEGER NOT NULL DEFAULT 0,
                 preview_platform TEXT NOT NULL DEFAULT 'auto',
                 notification_thread_id INTEGER,
@@ -232,6 +233,7 @@ class Database:
             "custom_buttons": "TEXT NOT NULL DEFAULT '[]'",
             "platform_button_groups": "TEXT NOT NULL DEFAULT '{}'",
             "subscription_button_groups": "TEXT NOT NULL DEFAULT '{}'",
+            "subscription_button_labels": "TEXT NOT NULL DEFAULT '{}'",
             "blur_preview": "INTEGER NOT NULL DEFAULT 0",
             "preview_platform": "TEXT NOT NULL DEFAULT 'auto'",
             "notification_thread_id": "INTEGER",
@@ -567,6 +569,32 @@ class Database:
         )
         self.connection.commit()
 
+    def get_subscription_button_labels(self, chat_id: int) -> dict[str, str]:
+        row = self.connection.execute(
+            "SELECT subscription_button_labels FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        try:
+            stored = json.loads(row["subscription_button_labels"]) if row else {}
+        except (TypeError, json.JSONDecodeError):
+            stored = {}
+        return {
+            str(subscription_id): label.strip()
+            for subscription_id, label in stored.items()
+            if isinstance(label, str) and label.strip()
+        }
+
+    def set_subscription_button_label(
+        self, chat_id: int, subscription_id: int, label: str
+    ) -> None:
+        labels = self.get_subscription_button_labels(chat_id)
+        labels[str(subscription_id)] = label
+        self.connection.execute(
+            "UPDATE chats SET subscription_button_labels = ? WHERE chat_id = ?",
+            (json.dumps(labels, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+
     def get_custom_buttons(self, chat_id: int) -> list[dict[str, str | int]]:
         row = self.connection.execute(
             "SELECT custom_buttons FROM chats WHERE chat_id = ?", (chat_id,)
@@ -629,6 +657,18 @@ class Database:
         if not 0 <= index < len(buttons):
             return False
         buttons[index]["group"] = group
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+        return True
+
+    def set_custom_button_label(self, chat_id: int, index: int, label: str) -> bool:
+        buttons = self.get_custom_buttons(chat_id)
+        if not 0 <= index < len(buttons):
+            return False
+        buttons[index]["label"] = label
         self.connection.execute(
             "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
             (json.dumps(buttons, ensure_ascii=False), chat_id),
@@ -757,6 +797,7 @@ class Database:
                 custom_buttons = '[]',
                 platform_button_groups = '{}',
                 subscription_button_groups = '{}',
+                subscription_button_labels = '{}',
                 blur_preview = 0,
                 preview_platform = 'auto',
                 notification_thread_id = NULL,
@@ -1288,6 +1329,8 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "custom_button_url",
         "custom_button_index",
         "custom_button_emoji_index",
+        "button_rename_kind",
+        "button_rename_id",
         "platform_group_chat_id",
         "platform_group_platform",
         "platform_group_subscription_id",
@@ -1756,29 +1799,9 @@ async def show_appearance_menu(
                         "🌫 Блюр превью", callback_data="appearance:blur"
                     ),
                     InlineKeyboardButton(
-                        "🔗 Кастомные кнопки",
-                        callback_data="appearance:custom_buttons",
+                        "🔗 Кнопки уведомления",
+                        callback_data="appearance:buttons",
                     ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🎨 Цвет кнопок", callback_data="appearance:colors"
-                    ),
-                    InlineKeyboardButton(
-                        "🎨 Цвет по кнопкам",
-                        callback_data="appearance:individual_colors",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "😀 Эмодзи", callback_data="appearance:emojis"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "↔️ Группы каналов",
-                        callback_data="appearance:platform_groups",
-                    )
                 ],
                 [
                     InlineKeyboardButton(
@@ -2053,6 +2076,31 @@ async def choose_custom_button_target(
     )
 
 
+async def choose_button_settings_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat["title"], callback_data=f"button_settings_chat:{chat['chat_id']}"
+            )
+        ]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
+    await render_ui(
+        update,
+        context,
+        "Выбери канал или группу для настройки кнопок:",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def choose_button_color_target(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2322,6 +2370,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "appearance:individual_colors":
         await choose_individual_button_color_target(update, context)
         return
+    if data == "appearance:buttons":
+        await choose_button_settings_target(update, context)
+        return
     if data == "appearance:custom_buttons":
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_custom_button_target(update, context)
@@ -2580,6 +2631,29 @@ async def menu_text_handler(
             InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
             ),
+        )
+        return
+    if wizard == "button_rename":
+        if not text or len(text) > 64:
+            await update.effective_message.reply_text(
+                "Название кнопки должно содержать от 1 до 64 символов."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        chat_id = context.user_data["custom_button_chat_id"]
+        kind = context.user_data["button_rename_kind"]
+        item_id = context.user_data["button_rename_id"]
+        if kind == "s":
+            database.set_subscription_button_label(chat_id, item_id, text)
+            changed = True
+        else:
+            changed = database.set_custom_button_label(chat_id, item_id, text)
+        clear_wizard(context)
+        await render_ui(
+            update,
+            context,
+            "Название кнопки сохранено." if changed else "Кнопка уже удалена.",
+            main_inline_keyboard(),
         )
         return
     if wizard == "custom_button_url":
@@ -2904,6 +2978,7 @@ async def select_example_chat(
         database.get_custom_buttons(chat_id),
         database.get_platform_button_groups(chat_id),
         database.get_subscription_button_groups(chat_id),
+        database.get_subscription_button_labels(chat_id),
     )
     try:
         if settings["preview_file_id"]:
@@ -3216,6 +3291,169 @@ async def select_individual_button_color_chat(
         context,
         "Выбери кнопку. Индивидуальный цвет имеет приоритет над общим.",
         InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_button_settings(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("button_settings_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    await render_ui(
+        update,
+        context,
+        "Настройка кнопок уведомления:",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Кастомные кнопки", callback_data=f"custom_chat:{chat_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Эмодзи площадок", callback_data=f"emoji_chat:{chat_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Группы каналов",
+                        callback_data=f"platform_groups_chat:{chat_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Переименовать кнопку",
+                        callback_data=f"button_rename_chat:{chat_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Цвет всех кнопок", callback_data=f"color_chat:{chat_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "Цвет по кнопкам",
+                        callback_data=f"individual_colors_chat:{chat_id}",
+                    ),
+                ],
+                [InlineKeyboardButton("Назад", callback_data="menu:appearance")],
+            ]
+        ),
+    )
+
+
+async def select_button_rename(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("button_rename_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{PLATFORM_NAMES[item['platform']]} · {item['channel_name']}",
+                callback_data=f"button_rename:{chat_id}:s{item['id']}",
+            )
+        ]
+        for item in database.get_chat_subscriptions(chat_id)
+    ]
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Кастомная · {button['label'][:30]}",
+                    callback_data=f"button_rename:{chat_id}:c{index}",
+                )
+            ]
+            for index, button in enumerate(database.get_custom_buttons(chat_id))
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "Назад", callback_data=f"button_settings_chat:{chat_id}"
+            )
+        ]
+    )
+    await render_ui(
+        update,
+        context,
+        "Выбери кнопку для переименования:",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def begin_button_rename(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, raw_key = query.data.split(":", 2)
+        chat_id = int(chat_id_text)
+        kind, item_id = raw_key[0], int(raw_key[1:])
+    except (ValueError, IndexError):
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if kind not in {"s", "c"} or not database.user_can_access_chat(
+        update.effective_user.id, chat_id
+    ):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    if kind == "s":
+        subscription = next(
+            (
+                item
+                for item in database.get_chat_subscriptions(chat_id)
+                if item["id"] == item_id
+            ),
+            None,
+        )
+        if not subscription:
+            await query.edit_message_text("Этот канал больше не привязан.")
+            return
+        current_label = database.get_subscription_button_labels(chat_id).get(
+            str(item_id), PLATFORM_NAMES[subscription["platform"]]
+        )
+    else:
+        buttons = database.get_custom_buttons(chat_id)
+        if not 0 <= item_id < len(buttons):
+            await query.edit_message_text("Эта кнопка уже удалена.")
+            return
+        current_label = str(buttons[item_id]["label"])
+    context.user_data["wizard"] = "button_rename"
+    context.user_data["custom_button_chat_id"] = chat_id
+    context.user_data["button_rename_kind"] = kind
+    context.user_data["button_rename_id"] = item_id
+    await query.edit_message_text(
+        f"Текущее название: «{current_label}».\nПришли новое название кнопки.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Отмена", callback_data=f"button_rename_chat:{chat_id}"
+                    )
+                ]
+            ]
+        ),
     )
 
 
@@ -3812,6 +4050,7 @@ def notification_keyboard(
     custom_buttons: list[dict[str, str]],
     platform_groups: dict[str, int],
     subscription_groups: dict[str, int],
+    subscription_labels: dict[str, str],
 ) -> InlineKeyboardMarkup:
     platform_names = {
         platform: (name, button_emojis[platform])
@@ -3827,8 +4066,11 @@ def notification_keyboard(
     groups: dict[int, list[InlineKeyboardButton]] = {}
     for subscription in subscriptions:
         platform, emoji = platform_names[subscription["platform"]]
-        label = platform
-        if platform_counts[subscription["platform"]] > 1:
+        label = subscription_labels.get(str(subscription["id"]), platform)
+        if (
+            str(subscription["id"]) not in subscription_labels
+            and platform_counts[subscription["platform"]] > 1
+        ):
             label += f" · {subscription['channel_name']}"
         group = subscription_groups.get(
             str(subscription["id"]), platform_groups[subscription["platform"]]
@@ -3911,6 +4153,7 @@ async def send_or_edit_notification(
         database.get_custom_buttons(chat_id),
         database.get_platform_button_groups(chat_id),
         database.get_subscription_button_groups(chat_id),
+        database.get_subscription_button_labels(chat_id),
     )
     message_id = settings["notification_message_id"]
     if message_id:
@@ -4259,6 +4502,15 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_emoji_chat, pattern=r"^emoji_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(show_button_settings, pattern=r"^button_settings_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_button_rename, pattern=r"^button_rename_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(begin_button_rename, pattern=r"^button_rename:")
     )
     application.add_handler(
         CallbackQueryHandler(select_emoji_platform, pattern=r"^emoji_platform:")
