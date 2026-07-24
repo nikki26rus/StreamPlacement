@@ -2347,9 +2347,11 @@ async def menu_text_handler(
     if text == MENU_ADD:
         clear_wizard(context)
         context.user_data["wizard"] = "add_platform"
-        await update.effective_message.reply_text(
+        await render_ui(
+            update,
+            context,
             "Выбери платформу:",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton("Twitch", callback_data="add:twitch"),
@@ -2406,8 +2408,8 @@ async def menu_text_handler(
         chat_id = context.user_data["template_edit_chat_id"]
         database.set_notification_template(chat_id, text)
         clear_wizard(context)
-        await update.effective_message.reply_text(
-            "Заголовок уведомления обновлён.", reply_markup=main_menu()
+        await render_ui(
+            update, context, "Заголовок уведомления обновлён.", main_inline_keyboard()
         )
         return
     if wizard == "description_text":
@@ -2428,8 +2430,8 @@ async def menu_text_handler(
         chat_id = context.user_data["description_edit_chat_id"]
         database.set_notification_description(chat_id, text)
         clear_wizard(context)
-        await update.effective_message.reply_text(
-            "Описание уведомления обновлено.", reply_markup=main_menu()
+        await render_ui(
+            update, context, "Описание уведомления обновлено.", main_inline_keyboard()
         )
         return
     if wizard == "discord_text":
@@ -2470,8 +2472,8 @@ async def menu_text_handler(
             database.set_button_custom_emoji_id(chat_id, platform_key, None)
         platform = platform_key.title()
         clear_wizard(context)
-        await update.effective_message.reply_text(
-            f"Эмодзи для {platform} сохранён.", reply_markup=main_menu()
+        await render_ui(
+            update, context, f"Эмодзи для {platform} сохранён.", main_inline_keyboard()
         )
         return
     if wizard == "custom_button_label":
@@ -2525,8 +2527,8 @@ async def menu_text_handler(
             group,
         )
         clear_wizard(context)
-        await update.effective_message.reply_text(
-            "Кастомная кнопка сохранена.", reply_markup=main_menu()
+        await render_ui(
+            update, context, "Кастомная кнопка сохранена.", main_inline_keyboard()
         )
         return
     if wizard == "custom_button_group_edit":
@@ -2546,9 +2548,11 @@ async def menu_text_handler(
             group,
         )
         clear_wizard(context)
-        await update.effective_message.reply_text(
+        await render_ui(
+            update,
+            context,
             "Группа кнопки сохранена." if changed else "Кнопка уже удалена.",
-            reply_markup=main_menu(),
+            main_inline_keyboard(),
         )
         return
     if wizard == "platform_button_group":
@@ -2576,9 +2580,7 @@ async def menu_text_handler(
         )
         return
 
-    await update.effective_message.reply_text(
-        "Используй кнопки меню ниже.", reply_markup=main_menu()
-    )
+    await render_ui(update, context, "Используй кнопки меню.", main_inline_keyboard())
 
 
 async def select_target_chat(
