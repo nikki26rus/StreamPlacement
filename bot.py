@@ -19,6 +19,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonCommands,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -4102,6 +4103,9 @@ async def post_init(application: Application) -> None:
             BotCommand("preview", "Загрузить картинку"),
             BotCommand("help", "Справка"),
         ]
+    )
+    await application.bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
     )
     application.job_queue.run_repeating(
         scheduled_check,
