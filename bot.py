@@ -2478,28 +2478,48 @@ async def menu_text_handler(
         return
     if wizard == "custom_button_label":
         if not text or len(text) > 64:
-            await update.effective_message.reply_text(
-                "Название кнопки должно содержать от 1 до 64 символов."
+            await render_ui(
+                update,
+                context,
+                "Название кнопки должно содержать от 1 до 64 символов.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+                ),
             )
             return
         context.user_data["custom_button_label"] = text
         context.user_data["wizard"] = "custom_button_url"
-        await update.effective_message.reply_text(
-            "Пришли ссылку для этой кнопки (http:// или https://)."
+        await render_ui(
+            update,
+            context,
+            "Пришли ссылку для этой кнопки (http:// или https://).",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            ),
         )
         return
     if wizard == "custom_button_url":
         parsed = urlparse(text)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            await update.effective_message.reply_text(
-                "Нужна корректная ссылка, начинающаяся с http:// или https://."
+            await render_ui(
+                update,
+                context,
+                "Нужна корректная ссылка, начинающаяся с http:// или https://.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+                ),
             )
             return
         context.user_data["custom_button_url"] = text
         context.user_data["wizard"] = "custom_button_group"
-        await update.effective_message.reply_text(
+        await render_ui(
+            update,
+            context,
             "Пришли номер строки от 1 до 20. Кнопки с одинаковым номером "
-            "будут расположены в одной строке."
+            "будут расположены в одной строке.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            ),
         )
         return
     if wizard == "custom_button_group":
@@ -2508,16 +2528,26 @@ async def menu_text_handler(
         except ValueError:
             group = 0
         if not 1 <= group <= 20:
-            await update.effective_message.reply_text(
-                "Пришли номер строки целым числом от 1 до 20."
+            await render_ui(
+                update,
+                context,
+                "Пришли номер строки целым числом от 1 до 20.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+                ),
             )
             return
         database: Database = context.application.bot_data["database"]
         chat_id = context.user_data["custom_button_chat_id"]
         buttons = database.get_custom_buttons(chat_id)
         if len(buttons) >= 20:
-            await update.effective_message.reply_text(
-                "Можно добавить не более 20 кастомных кнопок."
+            await render_ui(
+                update,
+                context,
+                "Можно добавить не более 20 кастомных кнопок.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+                ),
             )
             return
         database.add_custom_button(
