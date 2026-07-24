@@ -1222,34 +1222,22 @@ async def render_ui(
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """Обновляет единый экран навигации в личном чате."""
+    """Показывает единственный актуальный экран навигации внизу переписки."""
     if update.effective_chat.type != "private":
         await update.effective_message.reply_text(text, reply_markup=reply_markup)
         return
+    previous_message_id = context.user_data.get("ui_message_id")
     query = update.callback_query
-    if query and query.message:
-        context.user_data["ui_message_id"] = query.message.message_id
+    if query and query.message and not previous_message_id:
+        previous_message_id = query.message.message_id
+    if previous_message_id:
         try:
-            await query.edit_message_text(
-                text, reply_markup=reply_markup, disable_web_page_preview=True
-            )
-            return
-        except BadRequest as error:
-            if "Message is not modified" in str(error):
-                return
-    message_id = context.user_data.get("ui_message_id")
-    if message_id:
-        try:
-            await context.bot.edit_message_text(
+            await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
-                message_id=message_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
+                message_id=previous_message_id,
             )
-            return
         except BadRequest:
-            context.user_data.pop("ui_message_id", None)
+            pass
     message = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
