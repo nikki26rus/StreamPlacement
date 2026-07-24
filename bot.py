@@ -16,12 +16,10 @@ from zoneinfo import ZoneInfo
 import httpx
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from telegram import (
-    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    MenuButtonCommands,
+    MenuButtonDefault,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.error import BadRequest
@@ -1315,8 +1313,8 @@ def help_text() -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Системное меню команд доступно через кнопку Menu рядом с полем ввода.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Главные функции находятся на кнопках под полем ввода.",
+        reply_markup=main_menu(),
     )
     await show_main_menu(
         update,
@@ -4089,24 +4087,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Главное меню"),
-            BotCommand("add", "Добавить канал"),
-            BotCommand("subscriptions", "Мои подписки"),
-            BotCommand("appearance", "Оформление уведомлений"),
-            BotCommand("check", "Проверить эфиры"),
-            BotCommand("chats", "Подключённые чаты"),
-            BotCommand("list", "Список подписок"),
-            BotCommand("remove", "Удалить подписку"),
-            BotCommand("template", "Изменить заголовок"),
-            BotCommand("preview", "Загрузить картинку"),
-            BotCommand("help", "Справка"),
-        ]
-    )
-    await application.bot.set_chat_menu_button(
-        menu_button=MenuButtonCommands()
-    )
+    await application.bot.delete_my_commands()
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     application.job_queue.run_repeating(
         scheduled_check,
         interval=FAST_POLL_INTERVAL_SECONDS,
