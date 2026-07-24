@@ -174,6 +174,7 @@ class Database:
                 button_emojis TEXT NOT NULL DEFAULT '{}',
                 button_custom_emoji_ids TEXT NOT NULL DEFAULT '{}',
                 button_style TEXT NOT NULL DEFAULT '',
+                button_styles TEXT NOT NULL DEFAULT '{}',
                 custom_buttons TEXT NOT NULL DEFAULT '[]',
                 platform_button_groups TEXT NOT NULL DEFAULT '{}',
                 subscription_button_groups TEXT NOT NULL DEFAULT '{}',
@@ -226,6 +227,7 @@ class Database:
             "button_emojis": "TEXT NOT NULL DEFAULT '{}'",
             "button_custom_emoji_ids": "TEXT NOT NULL DEFAULT '{}'",
             "button_style": "TEXT NOT NULL DEFAULT ''",
+            "button_styles": "TEXT NOT NULL DEFAULT '{}'",
             "custom_buttons": "TEXT NOT NULL DEFAULT '[]'",
             "platform_button_groups": "TEXT NOT NULL DEFAULT '{}'",
             "subscription_button_groups": "TEXT NOT NULL DEFAULT '{}'",
@@ -374,7 +376,7 @@ class Database:
             """
             SELECT notification_template, notification_description, preview_file_id,
                    discord_url, button_emojis, button_custom_emoji_ids,
-                   button_style, custom_buttons, platform_button_groups,
+                   button_style, button_styles, custom_buttons, platform_button_groups,
                    blur_preview, preview_platform,
                    notification_thread_id, notification_message_id,
                    notification_has_photo
@@ -477,6 +479,36 @@ class Database:
     def set_button_style(self, chat_id: int, style: str) -> None:
         self.connection.execute(
             "UPDATE chats SET button_style = ? WHERE chat_id = ?", (style, chat_id)
+        )
+        self.connection.commit()
+
+    def get_button_styles(self, chat_id: int) -> dict[str, str]:
+        row = self.connection.execute(
+            "SELECT button_styles FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        try:
+            stored = json.loads(row["button_styles"]) if row else {}
+        except (TypeError, json.JSONDecodeError):
+            stored = {}
+        return {
+            str(key): str(style)
+            for key, style in stored.items()
+            if style in BUTTON_STYLES
+        }
+
+    def set_individual_button_style(
+        self, chat_id: int, button_key: str, style: str | None
+    ) -> None:
+        styles = self.get_button_styles(chat_id)
+        if style:
+            if style not in BUTTON_STYLES:
+                raise ValueError("Некорректный цвет кнопки")
+            styles[button_key] = style
+        else:
+            styles.pop(button_key, None)
+        self.connection.execute(
+            "UPDATE chats SET button_styles = ? WHERE chat_id = ?",
+            (json.dumps(styles, ensure_ascii=False), chat_id),
         )
         self.connection.commit()
 
@@ -695,6 +727,7 @@ class Database:
                 button_emojis = '{}',
                 button_custom_emoji_ids = '{}',
                 button_style = '',
+                button_styles = '{}',
                 custom_buttons = '[]',
                 platform_button_groups = '{}',
                 subscription_button_groups = '{}',
@@ -1701,8 +1734,14 @@ async def show_appearance_menu(
                         "🎨 Цвет кнопок", callback_data="appearance:colors"
                     ),
                     InlineKeyboardButton(
-                        "😀 Эмодзи", callback_data="appearance:emojis"
+                        "🎨 Цвет по кнопкам",
+                        callback_data="appearance:individual_colors",
                     ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "😀 Эмодзи", callback_data="appearance:emojis"
+                    )
                 ],
                 [
                     InlineKeyboardButton(
@@ -2000,6 +2039,28 @@ async def choose_button_color_target(
     )
 
 
+async def choose_individual_button_color_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat["title"], callback_data=f"individual_colors_chat:{chat['chat_id']}"
+            )
+        ]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
+    await render_ui(
+        update,
+        context,
+        "Выбери канал или группу для настройки цвета каждой кнопки:",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def choose_blur_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     database: Database = context.application.bot_data["database"]
     chats = database.list_user_chats(update.effective_user.id)
@@ -2216,6 +2277,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "appearance:colors":
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_button_color_target(update, context)
+        return
+    if data == "appearance:individual_colors":
+        await choose_individual_button_color_target(update, context)
         return
     if data == "appearance:custom_buttons":
         await query.edit_message_text("Выбираю канал или группу.")
@@ -2999,6 +3063,143 @@ async def set_button_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def select_individual_button_color_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("individual_colors_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{PLATFORM_NAMES[subscription['platform']]} · "
+                f"{subscription['channel_name']}",
+                callback_data=f"individual_color:{chat_id}:s{subscription['id']}",
+            )
+        ]
+        for subscription in database.get_chat_subscriptions(chat_id)
+    ]
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Кастомная · {button['label'][:30]}",
+                    callback_data=f"individual_color:{chat_id}:c{index}",
+                )
+            ]
+            for index, button in enumerate(database.get_custom_buttons(chat_id))
+        ]
+    )
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
+    await render_ui(
+        update,
+        context,
+        "Выбери кнопку. Индивидуальный цвет имеет приоритет над общим.",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def select_individual_button_color(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, raw_key = query.data.split(":", 2)
+        chat_id = int(chat_id_text)
+        kind, item_id = raw_key[0], int(raw_key[1:])
+        button_key = (
+            f"subscription:{item_id}" if kind == "s" else f"custom:{item_id}"
+        )
+    except (ValueError, IndexError):
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if kind not in {"s", "c"} or not database.user_can_access_chat(
+        update.effective_user.id, chat_id
+    ):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                name,
+                callback_data=f"individual_color_set:{chat_id}:{raw_key}:{style}",
+            )
+        ]
+        for style, name in BUTTON_STYLES.items()
+    ]
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "По умолчанию",
+                callback_data=f"individual_color_set:{chat_id}:{raw_key}:default",
+            )
+        ]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("Назад", callback_data=f"individual_colors_chat:{chat_id}")]
+    )
+    await render_ui(
+        update,
+        context,
+        "Выбери цвет этой кнопки:",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def set_individual_button_color(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, raw_key, style = query.data.split(":", 3)
+        chat_id = int(chat_id_text)
+        kind, item_id = raw_key[0], int(raw_key[1:])
+        button_key = (
+            f"subscription:{item_id}" if kind == "s" else f"custom:{item_id}"
+        )
+    except (ValueError, IndexError):
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if kind not in {"s", "c"} or not database.user_can_access_chat(
+        update.effective_user.id, chat_id
+    ):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    try:
+        database.set_individual_button_style(
+            chat_id, button_key, None if style == "default" else style
+        )
+    except ValueError:
+        await query.edit_message_text("Неизвестный цвет.")
+        return
+    await query.edit_message_text(
+        "Цвет кнопки сохранён.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Назад к кнопкам",
+                        callback_data=f"individual_colors_chat:{chat_id}",
+                    )
+                ],
+                [InlineKeyboardButton("В оформление", callback_data="menu:appearance")],
+            ]
+        ),
+    )
+
+
 async def select_custom_button_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -3440,6 +3641,7 @@ def notification_keyboard(
     button_emojis: dict[str, str],
     button_custom_emoji_ids: dict[str, str],
     button_style: str | None,
+    button_styles: dict[str, str],
     custom_buttons: list[dict[str, str]],
     platform_groups: dict[str, int],
     subscription_groups: dict[str, int],
@@ -3470,14 +3672,20 @@ def notification_keyboard(
                 subscription["channel_url"],
                 emoji,
                 button_custom_emoji_ids.get(subscription["platform"]),
-                button_style,
+                button_styles.get(
+                    f"subscription:{subscription['id']}", button_style
+                ),
             )
         )
-    for button in custom_buttons:
+    for index, button in enumerate(custom_buttons):
         group = button["group"] if isinstance(button.get("group"), int) else 1
         groups.setdefault(group, []).append(
             link_button(
-                str(button["label"]), str(button["url"]), "", None, button_style
+                str(button["label"]),
+                str(button["url"]),
+                "",
+                None,
+                button_styles.get(f"custom:{index}", button_style),
             )
         )
     rows = []
@@ -3532,6 +3740,7 @@ async def send_or_edit_notification(
         database.get_button_emojis(chat_id),
         database.get_button_custom_emoji_ids(chat_id),
         settings["button_style"] or None,
+        database.get_button_styles(chat_id),
         database.get_custom_buttons(chat_id),
         database.get_platform_button_groups(chat_id),
         database.get_subscription_button_groups(chat_id),
@@ -3888,6 +4097,22 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(set_button_color, pattern=r"^color_set:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            select_individual_button_color_chat,
+            pattern=r"^individual_colors_chat:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            select_individual_button_color, pattern=r"^individual_color:"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            set_individual_button_color, pattern=r"^individual_color_set:"
+        )
     )
     application.add_handler(
         CallbackQueryHandler(select_custom_button_chat, pattern=r"^custom_chat:")
