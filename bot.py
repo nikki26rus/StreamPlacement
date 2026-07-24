@@ -1213,19 +1213,8 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 def main_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ Добавить канал", callback_data="menu:add"),
-                InlineKeyboardButton("📺 Подписки", callback_data="menu:subscriptions"),
-            ],
-            [
-                InlineKeyboardButton("🔎 Проверить", callback_data="menu:check"),
-                InlineKeyboardButton("🎨 Оформление", callback_data="menu:appearance"),
-            ],
-            [InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help")],
-        ]
-    )
+    """Очищает inline-клавиатуру: основные разделы находятся в Telegram Menu."""
+    return InlineKeyboardMarkup([])
 
 
 async def render_ui(
@@ -1299,7 +1288,12 @@ async def show_main_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Выбери действие:"
 ) -> None:
     clear_wizard(context)
-    await render_ui(update, context, text, main_inline_keyboard())
+    await render_ui(
+        update,
+        context,
+        f"{text}\n\nОсновные действия доступны в кнопке Menu рядом с полем ввода.",
+        main_inline_keyboard(),
+    )
 
 
 def help_text() -> str:
@@ -4104,6 +4098,7 @@ async def post_init(application: Application) -> None:
             BotCommand("chats", "Подключённые чаты"),
             BotCommand("list", "Список подписок"),
             BotCommand("remove", "Удалить подписку"),
+            BotCommand("template", "Изменить заголовок"),
             BotCommand("preview", "Загрузить картинку"),
             BotCommand("help", "Справка"),
         ]
