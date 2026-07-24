@@ -1400,7 +1400,10 @@ async def menu_text_handler(
         platform = platform_key.title()
         clear_wizard(context)
         await render_ui(
-            update, context, f"Эмодзи для {platform} сохранён.", main_inline_keyboard()
+            update,
+            context,
+            f"Эмодзи для {platform} сохранён.",
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
     if wizard == "custom_button_emoji":
@@ -1431,6 +1434,7 @@ async def menu_text_handler(
             emoji,
             custom_emoji_id,
         )
+        chat_id = context.user_data["custom_button_chat_id"]
         clear_wizard(context)
         await render_ui(
             update,
@@ -1438,7 +1442,7 @@ async def menu_text_handler(
             "Эмодзи кастомной кнопки сохранён."
             if changed
             else "Кнопка уже удалена.",
-            main_inline_keyboard(),
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
     if wizard == "custom_button_label":
@@ -1483,7 +1487,7 @@ async def menu_text_handler(
             update,
             context,
             "Название кнопки сохранено." if changed else "Кнопка уже удалена.",
-            main_inline_keyboard(),
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
     if wizard == "custom_button_url":
@@ -1546,7 +1550,10 @@ async def menu_text_handler(
         )
         clear_wizard(context)
         await render_ui(
-            update, context, "Кастомная кнопка сохранена.", main_inline_keyboard()
+            update,
+            context,
+            "Кастомная кнопка сохранена.",
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
     if wizard == "custom_button_group_edit":
@@ -1565,12 +1572,13 @@ async def menu_text_handler(
             context.user_data["custom_button_index"],
             group,
         )
+        chat_id = context.user_data["custom_button_chat_id"]
         clear_wizard(context)
         await render_ui(
             update,
             context,
             "Группа кнопки сохранена." if changed else "Кнопка уже удалена.",
-            main_inline_keyboard(),
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
     if wizard == "platform_button_group":
@@ -1589,12 +1597,13 @@ async def menu_text_handler(
             context.user_data["platform_group_subscription_id"],
             group,
         )
+        chat_id = context.user_data["platform_group_chat_id"]
         clear_wizard(context)
         await render_ui(
             update,
             context,
             "Группа кнопки площадки сохранена.",
-            main_inline_keyboard(),
+            InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
         return
 
@@ -1997,10 +2006,17 @@ async def select_emoji_platform(
     context.user_data["emoji_chat_id"] = chat_id
     context.user_data["emoji_platform"] = platform
     await query.edit_message_text(
-        f"Пришли новый эмодзи для кнопки {platform.title()}.\n"
+        f"Пришли новый эмодзи для кнопок площадки {platform.title()}.\n"
+        "Он будет применён ко всем привязанным каналам этой площадки. "
         "Можно отправить один Unicode-эмодзи или кастомный эмодзи из Telegram.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "Отмена", callback_data=f"button_settings_chat:{chat_id}"
+                    )
+                ]
+            ]
         ),
     )
 
@@ -2101,6 +2117,95 @@ async def select_individual_button_color_chat(
     )
 
 
+def button_manager_rows(database: Database, chat_id: int) -> list[list[InlineKeyboardButton]]:
+    """Строит единый редактор для привязанных и кастомных кнопок."""
+    subscriptions = database.get_chat_subscriptions(chat_id)
+    custom_buttons = database.get_custom_buttons(chat_id)
+    emojis = database.get_button_emojis(chat_id)
+    subscription_groups = database.get_subscription_button_groups(chat_id)
+    platform_groups = database.get_platform_button_groups(chat_id)
+    subscription_labels = database.get_subscription_button_labels(chat_id)
+    rows = [
+        [InlineKeyboardButton("➕ Добавить кастомную кнопку", callback_data=f"custom_add:{chat_id}")],
+        [
+            InlineKeyboardButton(
+                "Цвет всех", callback_data=f"color_chat:{chat_id}"
+            ),
+            InlineKeyboardButton(
+                "Цвет по кнопкам", callback_data=f"individual_colors_chat:{chat_id}"
+            ),
+        ],
+    ]
+    for subscription in subscriptions:
+        subscription_id = subscription["id"]
+        platform = subscription["platform"]
+        label = subscription_labels.get(
+            str(subscription_id),
+            f"{PLATFORM_NAMES[platform]} · {subscription['channel_name']}",
+        )
+        group = subscription_groups.get(
+            str(subscription_id), platform_groups[platform]
+        )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"📺 {label[:42]} · строка {group}",
+                        callback_data=f"button_rename:{chat_id}:s{subscription_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️", callback_data=f"button_rename:{chat_id}:s{subscription_id}"
+                    ),
+                    InlineKeyboardButton(
+                        emojis[platform],
+                        callback_data=f"emoji_platform:{chat_id}:{platform}",
+                    ),
+                    InlineKeyboardButton(
+                        "↔️",
+                        callback_data=f"subscription_group:{chat_id}:{subscription_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🎨",
+                        callback_data=f"individual_color:{chat_id}:s{subscription_id}",
+                    ),
+                ],
+            ]
+        )
+    for index, button in enumerate(custom_buttons):
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🔗 {str(button['label'])[:42]} · строка {button['group']}",
+                        callback_data=f"button_rename:{chat_id}:c{index}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️", callback_data=f"button_rename:{chat_id}:c{index}"
+                    ),
+                    InlineKeyboardButton(
+                        str(button.get("emoji") or "😀"),
+                        callback_data=f"custom_emoji:{chat_id}:{index}",
+                    ),
+                    InlineKeyboardButton(
+                        "↔️", callback_data=f"custom_group:{chat_id}:{index}"
+                    ),
+                    InlineKeyboardButton(
+                        "🎨", callback_data=f"individual_color:{chat_id}:c{index}"
+                    ),
+                    InlineKeyboardButton(
+                        "🗑", callback_data=f"custom_delete:{chat_id}:{index}"
+                    ),
+                ],
+            ]
+        )
+    rows.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
+    return rows
+
+
 async def show_button_settings(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2118,42 +2223,10 @@ async def show_button_settings(
     await render_ui(
         update,
         context,
-        "Настройка кнопок уведомления:",
+        "Все кнопки уведомления. Для каждой кнопки доступны: ✏️ название, "
+        "😀 эмодзи, ↔️ строка и 🎨 цвет.",
         InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Кастомные кнопки", callback_data=f"custom_chat:{chat_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Эмодзи площадок", callback_data=f"emoji_chat:{chat_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Группы каналов",
-                        callback_data=f"platform_groups_chat:{chat_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✏️ Переименовать кнопку",
-                        callback_data=f"button_rename_chat:{chat_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Цвет всех кнопок", callback_data=f"color_chat:{chat_id}"
-                    ),
-                    InlineKeyboardButton(
-                        "Цвет по кнопкам",
-                        callback_data=f"individual_colors_chat:{chat_id}",
-                    ),
-                ],
-                [InlineKeyboardButton("Назад", callback_data="menu:appearance")],
-            ]
+            button_manager_rows(database, chat_id)
         ),
     )
 
@@ -2419,7 +2492,7 @@ async def begin_custom_button(
     await query.edit_message_text(
         "Пришли название новой кнопки.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            [[InlineKeyboardButton("Отмена", callback_data=f"button_settings_chat:{chat_id}")]]
         ),
     )
 
@@ -2446,10 +2519,10 @@ async def delete_custom_button(
             [
                 [
                     InlineKeyboardButton(
-                        "Назад к кнопкам", callback_data=f"custom_chat:{chat_id}"
+                        "Назад к кнопкам",
+                        callback_data=f"button_settings_chat:{chat_id}",
                     )
                 ],
-                [InlineKeyboardButton("В оформление", callback_data="menu:appearance")],
             ]
         ),
     )
@@ -2481,7 +2554,7 @@ async def begin_custom_button_group_edit(
         f"Текущая строка: {buttons[index]['group']}.\n"
         "Пришли новый номер строки от 1 до 20.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            [[InlineKeyboardButton("Отмена", callback_data=f"button_settings_chat:{chat_id}")]]
         ),
     )
 
@@ -2513,7 +2586,7 @@ async def begin_custom_button_emoji_edit(
         "Можно отправить Unicode-эмодзи или кастомный эмодзи Telegram. "
         "Отправь «-», чтобы убрать эмодзи.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            [[InlineKeyboardButton("Отмена", callback_data=f"button_settings_chat:{chat_id}")]]
         ),
     )
 
@@ -2605,7 +2678,7 @@ async def begin_platform_group_edit(
         f"Текущая строка {subscription['channel_name']}: {group}.\n"
         "Пришли новый номер строки от 1 до 20.",
         InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            [[InlineKeyboardButton("Отмена", callback_data=f"button_settings_chat:{chat_id}")]]
         ),
     )
 
