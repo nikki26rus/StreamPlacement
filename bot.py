@@ -588,6 +588,12 @@ class Database:
                         else 1,
                     ),
                 ),
+                "emoji": item.get("emoji", "")
+                if isinstance(item.get("emoji", ""), str)
+                else "",
+                "custom_emoji_id": item.get("custom_emoji_id")
+                if isinstance(item.get("custom_emoji_id"), str)
+                else None,
             }
             for item in stored
             if isinstance(item, dict)
@@ -623,6 +629,25 @@ class Database:
         if not 0 <= index < len(buttons):
             return False
         buttons[index]["group"] = group
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+        return True
+
+    def set_custom_button_emoji(
+        self,
+        chat_id: int,
+        index: int,
+        emoji: str,
+        custom_emoji_id: str | None,
+    ) -> bool:
+        buttons = self.get_custom_buttons(chat_id)
+        if not 0 <= index < len(buttons):
+            return False
+        buttons[index]["emoji"] = emoji
+        buttons[index]["custom_emoji_id"] = custom_emoji_id
         self.connection.execute(
             "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
             (json.dumps(buttons, ensure_ascii=False), chat_id),
@@ -1262,6 +1287,7 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "custom_button_label",
         "custom_button_url",
         "custom_button_index",
+        "custom_button_emoji_index",
         "platform_group_chat_id",
         "platform_group_platform",
         "platform_group_subscription_id",
@@ -2496,6 +2522,44 @@ async def menu_text_handler(
             update, context, f"Эмодзи для {platform} сохранён.", main_inline_keyboard()
         )
         return
+    if wizard == "custom_button_emoji":
+        emoji = "" if text == "-" else text.strip()
+        if emoji and (len(emoji) > 16 or any(character.isspace() for character in emoji)):
+            await render_ui(
+                update,
+                context,
+                "Пришли один эмодзи без пробелов или «-», чтобы убрать его.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+                ),
+            )
+            return
+        custom_emoji_id = next(
+            (
+                entity.custom_emoji_id
+                for entity in update.effective_message.entities or ()
+                if getattr(entity.type, "value", entity.type) == "custom_emoji"
+                and entity.custom_emoji_id
+            ),
+            None,
+        )
+        database: Database = context.application.bot_data["database"]
+        changed = database.set_custom_button_emoji(
+            context.user_data["custom_button_chat_id"],
+            context.user_data["custom_button_emoji_index"],
+            emoji,
+            custom_emoji_id,
+        )
+        clear_wizard(context)
+        await render_ui(
+            update,
+            context,
+            "Эмодзи кастомной кнопки сохранён."
+            if changed
+            else "Кнопка уже удалена.",
+            main_inline_keyboard(),
+        )
+        return
     if wizard == "custom_button_label":
         if not text or len(text) > 64:
             await render_ui(
@@ -3295,6 +3359,10 @@ async def select_custom_button_chat(
                 callback_data=f"custom_group:{chat_id}:{index}",
             ),
             InlineKeyboardButton(
+                button["emoji"] or "😀",
+                callback_data=f"custom_emoji:{chat_id}:{index}",
+            ),
+            InlineKeyboardButton(
                 "🗑", callback_data=f"custom_delete:{chat_id}:{index}"
             ),
         ]
@@ -3389,6 +3457,38 @@ async def begin_custom_button_group_edit(
     await query.edit_message_text(
         f"Текущая строка: {buttons[index]['group']}.\n"
         "Пришли новый номер строки от 1 до 20.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+        ),
+    )
+
+
+async def begin_custom_button_emoji_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, index_text = query.data.split(":", 2)
+        chat_id, index = int(chat_id_text), int(index_text)
+    except ValueError:
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    buttons = database.get_custom_buttons(chat_id)
+    if not 0 <= index < len(buttons):
+        await query.edit_message_text("Эта кнопка уже удалена.")
+        return
+    context.user_data["wizard"] = "custom_button_emoji"
+    context.user_data["custom_button_chat_id"] = chat_id
+    context.user_data["custom_button_emoji_index"] = index
+    await query.edit_message_text(
+        f"Пришли эмодзи для кнопки «{buttons[index]['label']}».\n"
+        "Можно отправить Unicode-эмодзи или кастомный эмодзи Telegram. "
+        "Отправь «-», чтобы убрать эмодзи.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
         ),
@@ -3710,7 +3810,13 @@ def custom_button_rows(
     for button in custom_buttons:
         group = button["group"] if isinstance(button.get("group"), int) else 1
         groups.setdefault(group, []).append(
-            link_button(str(button["label"]), str(button["url"]), "", None, button_style)
+            link_button(
+                str(button["label"]),
+                str(button["url"]),
+                str(button.get("emoji") or ""),
+                button.get("custom_emoji_id"),
+                button_style,
+            )
         )
     rows = []
     for group in sorted(groups):
@@ -3766,8 +3872,8 @@ def notification_keyboard(
             link_button(
                 str(button["label"]),
                 str(button["url"]),
-                "",
-                None,
+                str(button.get("emoji") or ""),
+                button.get("custom_emoji_id"),
                 button_styles.get(f"custom:{index}", button_style),
             )
         )
@@ -4213,6 +4319,11 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             begin_custom_button_group_edit, pattern=r"^custom_group:"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            begin_custom_button_emoji_edit, pattern=r"^custom_emoji:"
         )
     )
     application.add_handler(
