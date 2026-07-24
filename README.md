@@ -1,8 +1,24 @@
 # Stream notifier bot
 
-Telegram-бот отправляет в выбранные группы уведомления о начале Twitch и
-YouTube- и Kick-эфиров. Каналы добавляются в личке с ботом, а группа для уведомлений
+Telegram-бот отправляет в выбранные группы уведомления о начале Twitch, YouTube,
+Kick, VK, Rutube, Instagram и TikTok-эфиров. Каналы добавляются в личке с ботом, а группа для уведомлений
 выбирается кнопкой.
+
+## Структура проекта
+
+```text
+bot.py              # точка входа BotHost, Telegram-обработчики и планировщик
+config.py           # переменные окружения и интервалы опроса
+constants.py        # адреса API, названия платформ и настройки интерфейса
+models.py           # модели предметной области
+database.py         # SQLite-хранилище, схема и миграции
+providers.py        # API-клиенты, URL и разбор публичных страниц площадок
+notifications.py    # формирование клавиатур и отправка уведомлений
+test_public_urls.py # тесты URL и HTML-парсеров
+```
+
+На BotHost точка запуска остаётся прежней: `python -u bot.py`. Dockerfile
+копирует все Python-модули, поэтому дополнительные настройки запуска не требуются.
 
 ## Переменные окружения
 
@@ -10,9 +26,19 @@ YouTube- и Kick-эфиров. Каналы добавляются в личке
 
 - `BOT_TOKEN` — токен от [BotFather](https://t.me/BotFather).
 - `TWITCH_CLIENT_ID` и `TWITCH_CLIENT_SECRET` — приложение в [Twitch Developer Console](https://dev.twitch.tv/console/apps).
-- `YOUTUBE_API_KEY` — ключ Google Cloud проекта с включённым YouTube Data API v3.
 - `KICK_CLIENT_ID` и `KICK_CLIENT_SECRET` — данные приложения из
   [Kick Developer Portal](https://kick.com/settings/developer).
+- `INSTAGRAM_COOKIE`, `TIKTOK_COOKIE` и `STREAM_PROXY_URL` — необязательные
+  настройки для серверных запросов к публичным страницам. Cookie берётся из
+  заголовка `Cookie` в инструментах разработчика браузера после входа в аккаунт.
+  Не передавайте её третьим лицам и не коммитьте в репозиторий.
+
+YouTube, VK, Rutube, Instagram и TikTok проверяются по публичным страницам, поэтому
+ключи API для них не нужны. Это менее стабильно, чем API: площадки могут менять
+разметку или ограничивать запросы. При переходе на официальные API ключи создаются
+в [VK ID](https://id.vk.com/about/business/go/docs/ru/vk-id/latest/vk-id/overview),
+[Rutube Studio](https://studio.rutube.ru/), [Meta for Developers](https://developers.facebook.com/)
+и [TikTok for Developers](https://developers.tiktok.com/).
 
 База SQLite хранится в `DB_PATH`. Для Docker смонтируйте `/app/data` как постоянный том, иначе состояние подписок будет потеряно при пересоздании контейнера.
 
