@@ -2162,7 +2162,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "appearance:preview":
         clear_wizard(context)
         context.user_data["awaiting_preview"] = True
-        await query.edit_message_text("Пришли картинку как фото.")
+        await query.edit_message_text(
+            "Пришли картинку как фото.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            ),
+        )
         return
     if data == "appearance:clear_preview":
         await query.edit_message_text("Выбираю канал или группу.")
@@ -2559,7 +2564,10 @@ async def select_template_chat(
             f"{settings['notification_template']}\n\n"
             "Пришли новый заголовок. Доступны {count}, {time}, {titleYT}, "
             "{titleTwich}, {titleKick}, {categoryYT}, {categoryTwich}, "
-            "{categoryKick}."
+            "{categoryKick}.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            ),
         )
         return
 
@@ -2605,7 +2613,10 @@ async def select_description_chat(
             f"Текущее описание:\n{current_description}\n\n"
             "Пришли новое описание (до 350 символов). Доступны {count}, {time}, "
             "{titleYT}, {titleTwich}, {titleKick}, {categoryYT}, "
-            "{categoryTwich}, {categoryKick}."
+            "{categoryTwich}, {categoryKick}.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+            ),
         )
         return
 
@@ -2803,6 +2814,7 @@ async def select_preview_source_chat(
                 ]
                 for index in range(0, len(PLATFORM_NAMES), 2)
             ]
+            + [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
         ),
     )
 
@@ -2828,7 +2840,12 @@ async def set_preview_platform(
         await query.edit_message_text("Неизвестная площадка.")
         return
     label = "автовыбор" if platform == "auto" else PLATFORM_NAMES[platform]
-    await query.edit_message_text(f"Источник автоматического превью: {label}.")
+    await query.edit_message_text(
+        f"Источник автоматического превью: {label}.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
+        ),
+    )
 
 
 async def select_emoji_chat(
@@ -2861,6 +2878,7 @@ async def select_emoji_chat(
                 ]
                 for index in range(0, len(PLATFORM_NAMES), 2)
             ]
+            + [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
         ),
     )
 
@@ -2890,7 +2908,10 @@ async def select_emoji_platform(
     context.user_data["emoji_platform"] = platform
     await query.edit_message_text(
         f"Пришли новый эмодзи для кнопки {platform.title()}.\n"
-        "Можно отправить один Unicode-эмодзи или кастомный эмодзи из Telegram."
+        "Можно отправить один Unicode-эмодзи или кастомный эмодзи из Telegram.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2916,6 +2937,7 @@ async def select_button_color_chat(
         ]
         for style, name in BUTTON_STYLES.items()
     ]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
     await query.edit_message_text(
         "Выбери цвет для всех кнопок уведомления:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2938,7 +2960,10 @@ async def set_button_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     database.set_button_style(chat_id, style)
     await query.edit_message_text(
-        f"Цвет «{color_name}» сохранён для всех кнопок уведомления."
+        f"Цвет «{color_name}» сохранён для всех кнопок уведомления.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2972,6 +2997,7 @@ async def select_custom_button_chat(
         ]
         for index, button in enumerate(buttons)
     )
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu:appearance")])
     await query.edit_message_text(
         "Кастомные кнопки: "
         + (str(len(buttons)) if buttons else "пока нет")
@@ -2996,7 +3022,12 @@ async def begin_custom_button(
         return
     context.user_data["wizard"] = "custom_button_label"
     context.user_data["custom_button_chat_id"] = chat_id
-    await query.edit_message_text("Пришли название новой кнопки.")
+    await query.edit_message_text(
+        "Пришли название новой кнопки.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+        ),
+    )
 
 
 async def delete_custom_button(
@@ -3044,7 +3075,10 @@ async def begin_custom_button_group_edit(
     context.user_data["custom_button_index"] = index
     await query.edit_message_text(
         f"Текущая строка: {buttons[index]['group']}.\n"
-        "Пришли новый номер строки от 1 до 20."
+        "Пришли новый номер строки от 1 до 20.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -3109,6 +3143,9 @@ async def begin_platform_group_edit(
         context,
         f"Текущая строка {PLATFORM_NAMES[platform]}: {group}.\n"
         "Пришли новый номер строки от 1 до 20.",
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -3130,7 +3167,10 @@ async def toggle_preview_blur(
     await query.edit_message_text(
         "Блюр фона Twitch-превью включён. Аватар и обложка категории не размываются."
         if enabled
-        else "Блюр фона Twitch-превью выключен."
+        else "Блюр фона Twitch-превью выключен.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
+        ),
     )
 
 
