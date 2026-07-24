@@ -1433,7 +1433,6 @@ async def show_appearance_menu(
                 ],
                 [
                     InlineKeyboardButton(
-                    InlineKeyboardButton(
                         "🖼 Источник превью", callback_data="appearance:preview_source"
                     )
                 ],
