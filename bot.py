@@ -414,7 +414,7 @@ class Database:
         )
         self.connection.commit()
 
-    def get_custom_buttons(self, chat_id: int) -> list[dict[str, str]]:
+    def get_custom_buttons(self, chat_id: int) -> list[dict[str, str | int]]:
         row = self.connection.execute(
             "SELECT custom_buttons FROM chats WHERE chat_id = ?", (chat_id,)
         ).fetchone()
@@ -423,16 +423,30 @@ class Database:
         except (TypeError, json.JSONDecodeError):
             stored = []
         return [
-            {"label": item["label"], "url": item["url"]}
+            {
+                "label": item["label"],
+                "url": item["url"],
+                "group": max(
+                    1,
+                    min(
+                        20,
+                        item["group"]
+                        if isinstance(item.get("group"), int)
+                        else 1,
+                    ),
+                ),
+            }
             for item in stored
             if isinstance(item, dict)
             and isinstance(item.get("label"), str)
             and isinstance(item.get("url"), str)
         ]
 
-    def add_custom_button(self, chat_id: int, label: str, url: str) -> None:
+    def add_custom_button(
+        self, chat_id: int, label: str, url: str, group: int = 1
+    ) -> None:
         buttons = self.get_custom_buttons(chat_id)
-        buttons.append({"label": label, "url": url})
+        buttons.append({"label": label, "url": url, "group": group})
         self.connection.execute(
             "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
             (json.dumps(buttons, ensure_ascii=False), chat_id),
@@ -444,6 +458,18 @@ class Database:
         if not 0 <= index < len(buttons):
             return False
         buttons.pop(index)
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+        return True
+
+    def set_custom_button_group(self, chat_id: int, index: int, group: int) -> bool:
+        buttons = self.get_custom_buttons(chat_id)
+        if not 0 <= index < len(buttons):
+            return False
+        buttons[index]["group"] = group
         self.connection.execute(
             "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
             (json.dumps(buttons, ensure_ascii=False), chat_id),
@@ -999,6 +1025,8 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "emoji_platform",
         "custom_button_chat_id",
         "custom_button_label",
+        "custom_button_url",
+        "custom_button_index",
         "awaiting_preview",
         "pending_preview_file_id",
     ):
@@ -2070,19 +2098,62 @@ async def menu_text_handler(
                 "Нужна корректная ссылка, начинающаяся с http:// или https://."
             )
             return
+        context.user_data["custom_button_url"] = text
+        context.user_data["wizard"] = "custom_button_group"
+        await update.effective_message.reply_text(
+            "Пришли номер строки от 1 до 20. Кнопки с одинаковым номером "
+            "будут расположены в одной строке."
+        )
+        return
+    if wizard == "custom_button_group":
+        try:
+            group = int(text)
+        except ValueError:
+            group = 0
+        if not 1 <= group <= 20:
+            await update.effective_message.reply_text(
+                "Пришли номер строки целым числом от 1 до 20."
+            )
+            return
         database: Database = context.application.bot_data["database"]
         chat_id = context.user_data["custom_button_chat_id"]
-        label = context.user_data["custom_button_label"]
         buttons = database.get_custom_buttons(chat_id)
         if len(buttons) >= 20:
             await update.effective_message.reply_text(
                 "Можно добавить не более 20 кастомных кнопок."
             )
             return
-        database.add_custom_button(chat_id, label, text)
+        database.add_custom_button(
+            chat_id,
+            context.user_data["custom_button_label"],
+            context.user_data["custom_button_url"],
+            group,
+        )
         clear_wizard(context)
         await update.effective_message.reply_text(
             "Кастомная кнопка сохранена.", reply_markup=main_menu()
+        )
+        return
+    if wizard == "custom_button_group_edit":
+        try:
+            group = int(text)
+        except ValueError:
+            group = 0
+        if not 1 <= group <= 20:
+            await update.effective_message.reply_text(
+                "Пришли номер строки целым числом от 1 до 20."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        changed = database.set_custom_button_group(
+            context.user_data["custom_button_chat_id"],
+            context.user_data["custom_button_index"],
+            group,
+        )
+        clear_wizard(context)
+        await update.effective_message.reply_text(
+            "Группа кнопки сохранена." if changed else "Кнопка уже удалена.",
+            reply_markup=main_menu(),
         )
         return
 
@@ -2304,13 +2375,11 @@ async def select_example_chat(
         sample_buttons[index : index + 2]
         for index in range(0, len(sample_buttons), 2)
     ]
-    extra_sample_buttons = [
-        link_button(button["label"], button["url"], "", None, button_style)
-        for button in database.get_custom_buttons(chat_id)
-    ]
     sample_rows.extend(
-        extra_sample_buttons[index : index + 2]
-        for index in range(0, len(extra_sample_buttons), 2)
+        custom_button_rows(
+            database.get_custom_buttons(chat_id),
+            button_style,
+        )
     )
     sample_keyboard = InlineKeyboardMarkup(sample_rows)
     try:
@@ -2599,14 +2668,19 @@ async def select_custom_button_chat(
     keyboard.extend(
         [
             InlineKeyboardButton(
-                f"Удалить: {button['label'][:40]}",
-                callback_data=f"custom_delete:{chat_id}:{index}",
-            )
+                f"Строка {button['group']}: {button['label'][:32]}",
+                callback_data=f"custom_group:{chat_id}:{index}",
+            ),
+            InlineKeyboardButton(
+                "🗑", callback_data=f"custom_delete:{chat_id}:{index}"
+            ),
         ]
         for index, button in enumerate(buttons)
     )
     await query.edit_message_text(
-        "Кастомные кнопки: " + (str(len(buttons)) if buttons else "пока нет") + ".",
+        "Кастомные кнопки: "
+        + (str(len(buttons)) if buttons else "пока нет")
+        + ". Нажми кнопку, чтобы изменить номер её строки.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -2648,6 +2722,34 @@ async def delete_custom_button(
     deleted = database.remove_custom_button(chat_id, index)
     await query.edit_message_text(
         "Кнопка удалена." if deleted else "Эта кнопка уже удалена."
+    )
+
+
+async def begin_custom_button_group_edit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, index_text = query.data.split(":", 2)
+        chat_id, index = int(chat_id_text), int(index_text)
+    except ValueError:
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    buttons = database.get_custom_buttons(chat_id)
+    if not 0 <= index < len(buttons):
+        await query.edit_message_text("Эта кнопка уже удалена.")
+        return
+    context.user_data["wizard"] = "custom_button_group_edit"
+    context.user_data["custom_button_chat_id"] = chat_id
+    context.user_data["custom_button_index"] = index
+    await query.edit_message_text(
+        f"Текущая строка: {buttons[index]['group']}.\n"
+        "Пришли новый номер строки от 1 до 20."
     )
 
 
@@ -2789,6 +2891,23 @@ def format_live_notification(
     return "\n\n".join(lines)
 
 
+def custom_button_rows(
+    custom_buttons: list[dict[str, str | int]],
+    button_style: str | None,
+) -> list[list[InlineKeyboardButton]]:
+    groups: dict[int, list[InlineKeyboardButton]] = {}
+    for button in custom_buttons:
+        group = button["group"] if isinstance(button.get("group"), int) else 1
+        groups.setdefault(group, []).append(
+            link_button(str(button["label"]), str(button["url"]), "", None, button_style)
+        )
+    rows = []
+    for group in sorted(groups):
+        buttons = groups[group]
+        rows.extend(buttons[index : index + 8] for index in range(0, len(buttons), 8))
+    return rows
+
+
 def notification_keyboard(
     notifications: list[tuple[sqlite3.Row, LiveStream]],
     button_emojis: dict[str, str],
@@ -2827,15 +2946,7 @@ def notification_keyboard(
         platform_buttons[index : index + 2]
         for index in range(0, len(platform_buttons), 2)
     ]
-    extra_buttons = []
-    extra_buttons.extend(
-        link_button(button["label"], button["url"], "", None, button_style)
-        for button in custom_buttons
-    )
-    rows.extend(
-        extra_buttons[index : index + 2]
-        for index in range(0, len(extra_buttons), 2)
-    )
+    rows.extend(custom_button_rows(custom_buttons, button_style))
     return InlineKeyboardMarkup(rows)
 
 
@@ -3232,6 +3343,11 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(delete_custom_button, pattern=r"^custom_delete:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            begin_custom_button_group_edit, pattern=r"^custom_group:"
+        )
     )
     application.add_handler(
         CallbackQueryHandler(toggle_preview_blur, pattern=r"^blur_chat:")
