@@ -928,6 +928,8 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_subscription",
         "pending_template",
         "pending_description",
+        "template_edit_chat_id",
+        "description_edit_chat_id",
         "pending_discord_url",
         "emoji_chat_id",
         "emoji_platform",
@@ -1349,17 +1351,52 @@ async def show_appearance_menu(
         "Оформление уведомлений:",
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Изменить заголовок", callback_data="appearance:template")],
-                [InlineKeyboardButton("Изменить описание", callback_data="appearance:description")],
-                [InlineKeyboardButton("Установить свою картинку", callback_data="appearance:preview")],
-                [InlineKeyboardButton("Удалить свою картинку", callback_data="appearance:clear_preview")],
-                [InlineKeyboardButton("Добавить Discord", callback_data="appearance:discord")],
-                [InlineKeyboardButton("Эмодзи кнопок", callback_data="appearance:emojis")],
-                [InlineKeyboardButton("Цвет кнопок", callback_data="appearance:colors")],
-                [InlineKeyboardButton("Кастомные кнопки", callback_data="appearance:custom_buttons")],
-                [InlineKeyboardButton("Блюр превью Twitch", callback_data="appearance:blur")],
-                [InlineKeyboardButton("Показать пример", callback_data="appearance:example")],
-                [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Заголовок", callback_data="appearance:template"
+                    ),
+                    InlineKeyboardButton(
+                        "✏️ Описание", callback_data="appearance:description"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🖼 Своя картинка", callback_data="appearance:preview"
+                    ),
+                    InlineKeyboardButton(
+                        "🗑 Удалить картинку", callback_data="appearance:clear_preview"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🌫 Блюр Twitch-превью", callback_data="appearance:blur"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔗 Кастомные кнопки",
+                        callback_data="appearance:custom_buttons",
+                    ),
+                    InlineKeyboardButton(
+                        "💬 Discord", callback_data="appearance:discord"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎨 Цвет кнопок", callback_data="appearance:colors"
+                    ),
+                    InlineKeyboardButton(
+                        "😀 Эмодзи", callback_data="appearance:emojis"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "👁 Пример", callback_data="appearance:example"
+                    ),
+                    InlineKeyboardButton(
+                        "ℹ️ Настройки", callback_data="appearance:status"
+                    ),
+                ],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
             ]
         ),
@@ -1393,6 +1430,29 @@ async def choose_template_target(
     )
 
 
+async def choose_template_edit_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"], callback_data=f"template_chat:{chat_row['chat_id']}"
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, где изменить заголовок:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def choose_description_target(
     update: Update, context: ContextTypes.DEFAULT_TYPE, description: str
 ) -> None:
@@ -1416,6 +1476,30 @@ async def choose_description_target(
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
     await update.effective_message.reply_text(
         "Выбери канал или группу, для которых изменить описание:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_description_edit_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(update, context, "Нет доступных каналов или групп.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat_row["title"],
+                callback_data=f"description_chat:{chat_row['chat_id']}",
+            )
+        ]
+        for chat_row in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, где изменить описание:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -1671,23 +1755,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if data == "appearance:template":
         clear_wizard(context)
-        context.user_data["wizard"] = "template_text"
-        await query.edit_message_text(
-            "Пришли новый заголовок уведомления. Можно использовать {count} — "
-            "число новых эфиров, {time} — время начала, названия {titleYT}, "
-            "{titleTwich}, {titleKick} и категории {categoryYT}, "
-            "{categoryTwich}, {categoryKick}."
-        )
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_template_edit_target(update, context)
         return
     if data == "appearance:description":
         clear_wizard(context)
-        context.user_data["wizard"] = "description_text"
-        await query.edit_message_text(
-            "Пришли описание для уведомления: правила, ссылки или другую "
-            "информацию. Доступны {count}, {time}, {titleYT}, {titleTwich}, "
-            "{titleKick}, {categoryYT}, {categoryTwich}, {categoryKick}. "
-            "Максимум 350 символов."
-        )
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_description_edit_target(update, context)
         return
     if data == "appearance:preview":
         clear_wizard(context)
@@ -1810,6 +1884,20 @@ async def menu_text_handler(
             return
         await choose_template_target(update, context, text)
         return
+    if wizard == "template_edit_text":
+        if len(text) > 300:
+            await update.effective_message.reply_text(
+                "Текст слишком длинный: максимум 300 символов. Пришли другой."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        chat_id = context.user_data["template_edit_chat_id"]
+        database.set_notification_template(chat_id, text)
+        clear_wizard(context)
+        await update.effective_message.reply_text(
+            "Заголовок уведомления обновлён.", reply_markup=main_menu()
+        )
+        return
     if wizard == "description_text":
         if len(text) > 350:
             await update.effective_message.reply_text(
@@ -1817,6 +1905,20 @@ async def menu_text_handler(
             )
             return
         await choose_description_target(update, context, text)
+        return
+    if wizard == "description_edit_text":
+        if len(text) > 350:
+            await update.effective_message.reply_text(
+                "Описание слишком длинное: максимум 350 символов. Пришли другой текст."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        chat_id = context.user_data["description_edit_chat_id"]
+        database.set_notification_description(chat_id, text)
+        clear_wizard(context)
+        await update.effective_message.reply_text(
+            "Описание уведомления обновлено.", reply_markup=main_menu()
+        )
         return
     if wizard == "discord_text":
         try:
@@ -1955,7 +2057,7 @@ async def select_template_chat(
     query = update.callback_query
     await query.answer()
     template = context.user_data.get("pending_template")
-    if template is None or not query.data.startswith("template_chat:"):
+    if not query.data.startswith("template_chat:"):
         await query.edit_message_text("Эта кнопка уже неактуальна. Повтори /template.")
         return
 
@@ -1968,6 +2070,19 @@ async def select_template_chat(
     database: Database = context.application.bot_data["database"]
     if not database.user_can_access_chat(update.effective_user.id, chat_id):
         await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    if template is None:
+        settings = database.get_notification_settings(chat_id)
+        context.user_data["wizard"] = "template_edit_text"
+        context.user_data["template_edit_chat_id"] = chat_id
+        await query.edit_message_text(
+            "Текущий заголовок:\n"
+            f"{settings['notification_template']}\n\n"
+            "Пришли новый заголовок. Доступны {count}, {time}, {titleYT}, "
+            "{titleTwich}, {titleKick}, {categoryYT}, {categoryTwich}, "
+            "{categoryKick}."
+        )
         return
 
     database.set_notification_template(chat_id, template)
@@ -1986,7 +2101,7 @@ async def select_description_chat(
     query = update.callback_query
     await query.answer()
     description = context.user_data.get("pending_description")
-    if description is None or not query.data.startswith("description_chat:"):
+    if not query.data.startswith("description_chat:"):
         await query.edit_message_text(
             "Эта кнопка уже неактуальна. Открой «Оформление» заново."
         )
@@ -2001,6 +2116,19 @@ async def select_description_chat(
     database: Database = context.application.bot_data["database"]
     if not database.user_can_access_chat(update.effective_user.id, chat_id):
         await query.edit_message_text("Нет доступа к этому чату.")
+        return
+
+    if description is None:
+        settings = database.get_notification_settings(chat_id)
+        current_description = settings["notification_description"] or "— пустое —"
+        context.user_data["wizard"] = "description_edit_text"
+        context.user_data["description_edit_chat_id"] = chat_id
+        await query.edit_message_text(
+            f"Текущее описание:\n{current_description}\n\n"
+            "Пришли новое описание (до 350 символов). Доступны {count}, {time}, "
+            "{titleYT}, {titleTwich}, {titleKick}, {categoryYT}, "
+            "{categoryTwich}, {categoryKick}."
+        )
         return
 
     database.set_notification_description(chat_id, description)
@@ -2083,24 +2211,28 @@ async def select_example_chat(
             button_style,
         ),
     ]
-    sample_rows = [sample_buttons]
+    sample_rows = [
+        sample_buttons[index : index + 2]
+        for index in range(0, len(sample_buttons), 2)
+    ]
+    extra_sample_buttons = []
     if settings["discord_url"]:
-        sample_rows.append(
-            [
-                link_button(
-                    "Discord",
-                    settings["discord_url"],
-                    button_emojis["discord"],
-                    custom_emoji_ids.get("discord"),
-                    button_style,
-                )
-            ]
+        extra_sample_buttons.append(
+            link_button(
+                "Discord",
+                settings["discord_url"],
+                button_emojis["discord"],
+                custom_emoji_ids.get("discord"),
+                button_style,
+            )
         )
+    extra_sample_buttons.extend(
+        link_button(button["label"], button["url"], "", None, button_style)
+        for button in database.get_custom_buttons(chat_id)
+    )
     sample_rows.extend(
-        [
-            [link_button(button["label"], button["url"], "", None, button_style)]
-            for button in database.get_custom_buttons(chat_id)
-        ]
+        extra_sample_buttons[index : index + 2]
+        for index in range(0, len(extra_sample_buttons), 2)
     )
     sample_keyboard = InlineKeyboardMarkup(sample_rows)
     try:
@@ -2553,26 +2685,27 @@ def notification_keyboard(
             )
         )
     rows = [
-        platform_buttons[index : index + 8]
-        for index in range(0, len(platform_buttons), 8)
+        platform_buttons[index : index + 2]
+        for index in range(0, len(platform_buttons), 2)
     ]
+    extra_buttons = []
     if discord_url:
-        rows.append(
-            [
-                link_button(
-                    "Discord",
-                    discord_url,
-                    button_emojis["discord"],
-                    button_custom_emoji_ids.get("discord"),
-                    button_style,
-                )
-            ]
+        extra_buttons.append(
+            link_button(
+                "Discord",
+                discord_url,
+                button_emojis["discord"],
+                button_custom_emoji_ids.get("discord"),
+                button_style,
+            )
         )
+    extra_buttons.extend(
+        link_button(button["label"], button["url"], "", None, button_style)
+        for button in custom_buttons
+    )
     rows.extend(
-        [
-            [link_button(button["label"], button["url"], "", None, button_style)]
-            for button in custom_buttons
-        ]
+        extra_buttons[index : index + 2]
+        for index in range(0, len(extra_buttons), 2)
     )
     return InlineKeyboardMarkup(rows)
 
