@@ -2895,38 +2895,16 @@ async def select_example_chat(
         settings["notification_description"],
         count_override=1,
     )
-    button_emojis = database.get_button_emojis(chat_id)
-    custom_emoji_ids = database.get_button_custom_emoji_ids(chat_id)
-    button_style = database.get_button_style(chat_id)
-    sample_buttons = [
-        link_button(
-            name,
-            {
-                "twitch": "https://www.twitch.tv/",
-                "youtube": "https://www.youtube.com/",
-                "kick": "https://kick.com/",
-                "vk": "https://vk.com/",
-                "rutube": "https://rutube.ru/",
-                "instagram": "https://instagram.com/",
-                "tiktok": "https://tiktok.com/",
-            }[platform],
-            button_emojis[platform],
-            custom_emoji_ids.get(platform),
-            button_style,
-        )
-        for platform, name in PLATFORM_NAMES.items()
-    ]
-    sample_rows = [
-        sample_buttons[index : index + 2]
-        for index in range(0, len(sample_buttons), 2)
-    ]
-    sample_rows.extend(
-        custom_button_rows(
-            database.get_custom_buttons(chat_id),
-            button_style,
-        )
+    sample_keyboard = notification_keyboard(
+        database.get_chat_subscriptions(chat_id),
+        database.get_button_emojis(chat_id),
+        database.get_button_custom_emoji_ids(chat_id),
+        settings["button_style"] or None,
+        database.get_button_styles(chat_id),
+        database.get_custom_buttons(chat_id),
+        database.get_platform_button_groups(chat_id),
+        database.get_subscription_button_groups(chat_id),
     )
-    sample_keyboard = InlineKeyboardMarkup(sample_rows)
     try:
         if settings["preview_file_id"]:
             await context.bot.send_photo(
