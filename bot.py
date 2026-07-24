@@ -2256,7 +2256,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             update.effective_user.id, subscription_id
         )
         await query.edit_message_text(
-            "Подписка удалена." if removed else "Подписка уже удалена."
+            "Подписка удалена." if removed else "Подписка уже удалена.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "К подпискам", callback_data="menu:subscriptions"
+                        )
+                    ],
+                    [InlineKeyboardButton("В меню", callback_data="menu:home")],
+                ]
+            ),
         )
         return
     if data == "menu:check":
@@ -2355,7 +2365,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"({target}, {preview}, источник: {preview_source}, {blur}, "
                 f"{description}, кастомных кнопок: {custom_buttons})"
             )
-        await query.edit_message_text("\n".join(lines))
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+            ),
+        )
 
 
 async def menu_text_handler(
@@ -2682,7 +2697,10 @@ async def select_target_chat(
     context.user_data.pop("add_platform", None)
     await query.edit_message_text(
         f"Готово: #{subscription_id} — {pending['channel_name']}.\n"
-        "Первый опрос только запомнит текущий статус эфира."
+        "Первый опрос только запомнит текущий статус эфира.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В меню", callback_data="menu:home")]]
+        ),
     )
 
 
@@ -2729,7 +2747,10 @@ async def select_template_chat(
     await query.edit_message_text(
         "Заголовок уведомления сохранён.\n"
         "Предпросмотр: "
-        f"{template.replace('{count}', '2').replace('{time}', '12:00')}"
+        f"{template.replace('{count}', '2').replace('{time}', '12:00')}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2776,7 +2797,10 @@ async def select_description_chat(
     context.user_data.pop("pending_description", None)
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
-        "Описание сохранено. Оно появится в следующем уведомлении."
+        "Описание сохранено. Оно появится в следующем уведомлении.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2880,7 +2904,10 @@ async def select_example_chat(
         return
 
     await query.edit_message_text(
-        "Пример отправлен сюда, в личный чат. Уведомление в канале не публиковалось."
+        "Пример отправлен сюда, в личный чат. Уведомление в канале не публиковалось.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2911,7 +2938,10 @@ async def select_discord_chat(
     context.user_data.pop("pending_discord_url", None)
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
-        "Discord-ссылка сохранена как кастомная кнопка."
+        "Discord-ссылка сохранена как кастомная кнопка.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -2934,7 +2964,10 @@ async def select_preview_clear_chat(
     database.clear_preview_file_id(chat_id)
     await query.edit_message_text(
         "Своя картинка удалена. В следующем уведомлении будет использовано "
-        "автоматическое превью."
+        "автоматическое превью.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
@@ -3336,7 +3369,17 @@ async def delete_custom_button(
         return
     deleted = database.remove_custom_button(chat_id, index)
     await query.edit_message_text(
-        "Кнопка удалена." if deleted else "Эта кнопка уже удалена."
+        "Кнопка удалена." if deleted else "Эта кнопка уже удалена.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Назад к кнопкам", callback_data=f"custom_chat:{chat_id}"
+                    )
+                ],
+                [InlineKeyboardButton("В оформление", callback_data="menu:appearance")],
+            ]
+        ),
     )
 
 
@@ -3572,7 +3615,10 @@ async def select_preview_chat(
     context.user_data.pop("pending_preview_file_id", None)
     context.user_data.pop("wizard", None)
     await query.edit_message_text(
-        "Картинка сохранена. Она будет использована в следующем уведомлении."
+        "Картинка сохранена. Она будет использована в следующем уведомлении.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
+        ),
     )
 
 
