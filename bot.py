@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -85,6 +85,11 @@ DEFAULT_BUTTON_EMOJIS = {
     "kick": "🟢",
     "discord": "💬",
 }
+BUTTON_STYLES = {
+    "primary": "Синий",
+    "success": "Зелёный",
+    "danger": "Красный",
+}
 
 
 @dataclass
@@ -117,6 +122,9 @@ class Database:
                 discord_url TEXT,
                 button_emojis TEXT NOT NULL DEFAULT '{}',
                 button_custom_emoji_ids TEXT NOT NULL DEFAULT '{}',
+                button_style TEXT NOT NULL DEFAULT '',
+                custom_buttons TEXT NOT NULL DEFAULT '[]',
+                blur_preview INTEGER NOT NULL DEFAULT 0,
                 notification_thread_id INTEGER,
                 notification_message_id INTEGER,
                 notification_has_photo INTEGER NOT NULL DEFAULT 0,
@@ -158,6 +166,9 @@ class Database:
             "discord_url": "TEXT",
             "button_emojis": "TEXT NOT NULL DEFAULT '{}'",
             "button_custom_emoji_ids": "TEXT NOT NULL DEFAULT '{}'",
+            "button_style": "TEXT NOT NULL DEFAULT ''",
+            "custom_buttons": "TEXT NOT NULL DEFAULT '[]'",
+            "blur_preview": "INTEGER NOT NULL DEFAULT 0",
             "notification_thread_id": "INTEGER",
             "notification_message_id": "INTEGER",
             "notification_has_photo": "INTEGER NOT NULL DEFAULT 0",
@@ -296,6 +307,7 @@ class Database:
             """
             SELECT notification_template, notification_description, preview_file_id,
                    discord_url, button_emojis, button_custom_emoji_ids,
+                   button_style, custom_buttons, blur_preview,
                    notification_thread_id, notification_message_id,
                    notification_has_photo
             FROM chats WHERE chat_id = ?
@@ -387,6 +399,70 @@ class Database:
             (json.dumps(custom_emoji_ids), chat_id),
         )
         self.connection.commit()
+
+    def get_button_style(self, chat_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT button_style FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return str(row["button_style"]) if row and row["button_style"] else None
+
+    def set_button_style(self, chat_id: int, style: str) -> None:
+        self.connection.execute(
+            "UPDATE chats SET button_style = ? WHERE chat_id = ?", (style, chat_id)
+        )
+        self.connection.commit()
+
+    def get_custom_buttons(self, chat_id: int) -> list[dict[str, str]]:
+        row = self.connection.execute(
+            "SELECT custom_buttons FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        try:
+            stored = json.loads(row["custom_buttons"]) if row else []
+        except (TypeError, json.JSONDecodeError):
+            stored = []
+        return [
+            {"label": item["label"], "url": item["url"]}
+            for item in stored
+            if isinstance(item, dict)
+            and isinstance(item.get("label"), str)
+            and isinstance(item.get("url"), str)
+        ]
+
+    def add_custom_button(self, chat_id: int, label: str, url: str) -> None:
+        buttons = self.get_custom_buttons(chat_id)
+        buttons.append({"label": label, "url": url})
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+
+    def remove_custom_button(self, chat_id: int, index: int) -> bool:
+        buttons = self.get_custom_buttons(chat_id)
+        if not 0 <= index < len(buttons):
+            return False
+        buttons.pop(index)
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+        return True
+
+    def toggle_preview_blur(self, chat_id: int) -> bool:
+        self.connection.execute(
+            """
+            UPDATE chats SET blur_preview = CASE blur_preview
+                WHEN 0 THEN 1 ELSE 0 END
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT blur_preview FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return bool(row and row["blur_preview"])
 
     def set_notification_thread(self, chat_id: int, thread_id: int) -> None:
         self.connection.execute(
@@ -758,13 +834,17 @@ class StreamProviders:
         response.raise_for_status()
         return Image.open(BytesIO(response.content)).convert("RGB")
 
-    async def twitch_notification_preview(self, stream: LiveStream) -> BytesIO | None:
+    async def twitch_notification_preview(
+        self, stream: LiveStream, *, blur_background: bool = False
+    ) -> BytesIO | None:
         """Создаёт карточку из превью эфира, аватара стримера и обложки игры."""
         if not stream.thumbnail_url:
             return None
         try:
             background = await self._download_image(stream.thumbnail_url)
             card = ImageOps.fit(background, (1280, 720), method=Image.Resampling.LANCZOS)
+            if blur_background:
+                card = card.filter(ImageFilter.GaussianBlur(radius=18))
             overlay = Image.new("RGBA", card.size, (0, 0, 0, 85))
             card = Image.alpha_composite(card.convert("RGBA"), overlay)
 
@@ -851,6 +931,8 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_discord_url",
         "emoji_chat_id",
         "emoji_platform",
+        "custom_button_chat_id",
+        "custom_button_label",
         "awaiting_preview",
         "pending_preview_file_id",
     ):
@@ -1273,6 +1355,9 @@ async def show_appearance_menu(
                 [InlineKeyboardButton("Удалить свою картинку", callback_data="appearance:clear_preview")],
                 [InlineKeyboardButton("Добавить Discord", callback_data="appearance:discord")],
                 [InlineKeyboardButton("Эмодзи кнопок", callback_data="appearance:emojis")],
+                [InlineKeyboardButton("Цвет кнопок", callback_data="appearance:colors")],
+                [InlineKeyboardButton("Кастомные кнопки", callback_data="appearance:custom_buttons")],
+                [InlineKeyboardButton("Блюр превью Twitch", callback_data="appearance:blur")],
                 [InlineKeyboardButton("Показать пример", callback_data="appearance:example")],
                 [InlineKeyboardButton("Показать настройки", callback_data="appearance:status")],
                 [InlineKeyboardButton("В меню", callback_data="menu:home")],
@@ -1437,6 +1522,52 @@ async def choose_emoji_target(
     )
 
 
+async def choose_custom_button_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton(chat["title"], callback_data=f"custom_chat:{chat['chat_id']}")]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу для кастомных кнопок:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_button_color_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton(chat["title"], callback_data=f"color_chat:{chat['chat_id']}")]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу для цвета кнопок:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def choose_blur_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    database: Database = context.application.bot_data["database"]
+    chats = database.list_user_chats(update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton(chat["title"], callback_data=f"blur_chat:{chat['chat_id']}")]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="menu:home")])
+    await update.effective_message.reply_text(
+        "Выбери канал или группу, где включить или выключить блюр:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1571,6 +1702,18 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Выбираю канал или группу.")
         await choose_emoji_target(update, context)
         return
+    if data == "appearance:colors":
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_button_color_target(update, context)
+        return
+    if data == "appearance:custom_buttons":
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_custom_button_target(update, context)
+        return
+    if data == "appearance:blur":
+        await query.edit_message_text("Выбираю канал или группу.")
+        await choose_blur_target(update, context)
+        return
     if data == "appearance:example":
         await query.edit_message_text("Выбираю настройки для примера.")
         await choose_example_target(update, context)
@@ -1603,9 +1746,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 else "общий чат"
             )
             discord = "Discord подключён" if settings["discord_url"] else "без Discord"
+            blur = "блюр Twitch-превью" if settings["blur_preview"] else "без блюра"
+            custom_buttons = len(database.get_custom_buttons(chat["chat_id"]))
             lines.append(
                 f"• {chat['title']}: {settings['notification_template']} "
-                f"({target}, {preview}, {description}, {discord})"
+                f"({target}, {preview}, {blur}, {description}, {discord}, "
+                f"кастомных кнопок: {custom_buttons})"
             )
         await query.edit_message_text("\n".join(lines))
 
@@ -1712,6 +1858,40 @@ async def menu_text_handler(
         clear_wizard(context)
         await update.effective_message.reply_text(
             f"Эмодзи для {platform} сохранён.", reply_markup=main_menu()
+        )
+        return
+    if wizard == "custom_button_label":
+        if not text or len(text) > 64:
+            await update.effective_message.reply_text(
+                "Название кнопки должно содержать от 1 до 64 символов."
+            )
+            return
+        context.user_data["custom_button_label"] = text
+        context.user_data["wizard"] = "custom_button_url"
+        await update.effective_message.reply_text(
+            "Пришли ссылку для этой кнопки (http:// или https://)."
+        )
+        return
+    if wizard == "custom_button_url":
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            await update.effective_message.reply_text(
+                "Нужна корректная ссылка, начинающаяся с http:// или https://."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        chat_id = context.user_data["custom_button_chat_id"]
+        label = context.user_data["custom_button_label"]
+        buttons = database.get_custom_buttons(chat_id)
+        if len(buttons) >= 20:
+            await update.effective_message.reply_text(
+                "Можно добавить не более 20 кастомных кнопок."
+            )
+            return
+        database.add_custom_button(chat_id, label, text)
+        clear_wizard(context)
+        await update.effective_message.reply_text(
+            "Кастомная кнопка сохранена.", reply_markup=main_menu()
         )
         return
 
@@ -1836,20 +2016,22 @@ def link_button(
     url: str,
     emoji: str,
     custom_emoji_id: str | None,
+    style: str | None = None,
 ) -> InlineKeyboardButton:
-    text = label if custom_emoji_id else f"{emoji} {label}"
+    text = label if custom_emoji_id else f"{emoji + ' ' if emoji else ''}{label}"
     if custom_emoji_id:
         try:
             return InlineKeyboardButton(
                 text,
                 url=url,
                 icon_custom_emoji_id=custom_emoji_id,
+                style=style,
             )
         except TypeError:
             logger.warning(
                 "Установлена устаревшая python-telegram-bot без custom emoji в кнопках"
             )
-    return InlineKeyboardButton(text, url=url)
+    return InlineKeyboardButton(text, url=url, style=style)
 
 
 async def select_example_chat(
@@ -1877,24 +2059,28 @@ async def select_example_chat(
     )
     button_emojis = database.get_button_emojis(chat_id)
     custom_emoji_ids = database.get_button_custom_emoji_ids(chat_id)
+    button_style = database.get_button_style(chat_id)
     sample_buttons = [
         link_button(
             "Twitch",
             "https://www.twitch.tv/",
             button_emojis["twitch"],
             custom_emoji_ids.get("twitch"),
+            button_style,
         ),
         link_button(
             "YouTube",
             "https://www.youtube.com/",
             button_emojis["youtube"],
             custom_emoji_ids.get("youtube"),
+            button_style,
         ),
         link_button(
             "Kick",
             "https://kick.com/",
             button_emojis["kick"],
             custom_emoji_ids.get("kick"),
+            button_style,
         ),
     ]
     sample_rows = [sample_buttons]
@@ -1906,9 +2092,16 @@ async def select_example_chat(
                     settings["discord_url"],
                     button_emojis["discord"],
                     custom_emoji_ids.get("discord"),
+                    button_style,
                 )
             ]
         )
+    sample_rows.extend(
+        [
+            [link_button(button["label"], button["url"], "", None, button_style)]
+            for button in database.get_custom_buttons(chat_id)
+        ]
+    )
     sample_keyboard = InlineKeyboardMarkup(sample_rows)
     try:
         if settings["preview_file_id"]:
@@ -2065,6 +2258,149 @@ async def select_emoji_platform(
     )
 
 
+async def select_button_color_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("color_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                name, callback_data=f"color_set:{chat_id}:{style}"
+            )
+        ]
+        for style, name in BUTTON_STYLES.items()
+    ]
+    await query.edit_message_text(
+        "Выбери цвет для всех кнопок уведомления:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def set_button_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, style = query.data.split(":", 2)
+        chat_id = int(chat_id_text)
+        color_name = BUTTON_STYLES[style]
+    except (ValueError, KeyError):
+        await query.edit_message_text("Некорректный цвет. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    database.set_button_style(chat_id, style)
+    await query.edit_message_text(
+        f"Цвет «{color_name}» сохранён для всех кнопок уведомления."
+    )
+
+
+async def select_custom_button_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("custom_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    buttons = database.get_custom_buttons(chat_id)
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить кнопку", callback_data=f"custom_add:{chat_id}")]
+    ]
+    keyboard.extend(
+        [
+            InlineKeyboardButton(
+                f"Удалить: {button['label'][:40]}",
+                callback_data=f"custom_delete:{chat_id}:{index}",
+            )
+        ]
+        for index, button in enumerate(buttons)
+    )
+    await query.edit_message_text(
+        "Кастомные кнопки: " + (str(len(buttons)) if buttons else "пока нет") + ".",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def begin_custom_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("custom_add:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    context.user_data["wizard"] = "custom_button_label"
+    context.user_data["custom_button_chat_id"] = chat_id
+    await query.edit_message_text("Пришли название новой кнопки.")
+
+
+async def delete_custom_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_text, index_text = query.data.split(":", 2)
+        chat_id, index = int(chat_id_text), int(index_text)
+    except ValueError:
+        await query.edit_message_text("Некорректная кнопка. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    deleted = database.remove_custom_button(chat_id, index)
+    await query.edit_message_text(
+        "Кнопка удалена." if deleted else "Эта кнопка уже удалена."
+    )
+
+
+async def toggle_preview_blur(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        chat_id = int(query.data.removeprefix("blur_chat:"))
+    except ValueError:
+        await query.edit_message_text("Некорректный чат. Повтори настройку.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    enabled = database.toggle_preview_blur(chat_id)
+    await query.edit_message_text(
+        "Блюр фона Twitch-превью включён. Аватар и обложка категории не размываются."
+        if enabled
+        else "Блюр фона Twitch-превью выключен."
+    )
+
+
 async def select_preview_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2186,6 +2522,8 @@ def notification_keyboard(
     discord_url: str | None,
     button_emojis: dict[str, str],
     button_custom_emoji_ids: dict[str, str],
+    button_style: str | None,
+    custom_buttons: list[dict[str, str]],
 ) -> InlineKeyboardMarkup:
     platform_names = {
         "twitch": ("Twitch", button_emojis["twitch"]),
@@ -2211,6 +2549,7 @@ def notification_keyboard(
                 stream.url,
                 emoji,
                 button_custom_emoji_ids.get(subscription["platform"]),
+                button_style,
             )
         )
     rows = [
@@ -2225,9 +2564,16 @@ def notification_keyboard(
                     discord_url,
                     button_emojis["discord"],
                     button_custom_emoji_ids.get("discord"),
+                    button_style,
                 )
             ]
         )
+    rows.extend(
+        [
+            [link_button(button["label"], button["url"], "", None, button_style)]
+            for button in custom_buttons
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -2276,6 +2622,8 @@ async def send_or_edit_notification(
         settings["discord_url"],
         database.get_button_emojis(chat_id),
         database.get_button_custom_emoji_ids(chat_id),
+        settings["button_style"] or None,
+        database.get_custom_buttons(chat_id),
     )
     message_id = settings["notification_message_id"]
     if message_id:
@@ -2317,7 +2665,9 @@ async def send_or_edit_notification(
         )
         if twitch_stream:
             providers: StreamProviders = application.bot_data["providers"]
-            preview = await providers.twitch_notification_preview(twitch_stream)
+            preview = await providers.twitch_notification_preview(
+                twitch_stream, blur_background=bool(settings["blur_preview"])
+            )
             if not preview:
                 preview = twitch_stream.thumbnail_url
         if not preview:
@@ -2578,6 +2928,24 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_emoji_platform, pattern=r"^emoji_platform:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_button_color_chat, pattern=r"^color_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(set_button_color, pattern=r"^color_set:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(select_custom_button_chat, pattern=r"^custom_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(begin_custom_button, pattern=r"^custom_add:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_custom_button, pattern=r"^custom_delete:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(toggle_preview_blur, pattern=r"^blur_chat:")
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
