@@ -101,7 +101,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         [
             [MENU_ADD, MENU_SUBSCRIPTIONS],
             [MENU_CHECK, MENU_APPEARANCE],
-            [MENU_HELP, MENU_CANCEL],
+            [MENU_HELP, "🔄 Режим"],
         ],
         resize_keyboard=True,
     )
@@ -203,10 +203,34 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Главные функции находятся на кнопках под полем ввода.",
         reply_markup=main_menu(),
     )
-    await show_main_menu(
+    database: Database = context.application.bot_data["database"]
+    if not database.get_user_mode(update.effective_user.id):
+        await choose_user_mode(update, context)
+        return
+    await show_main_menu(update, context, "Добро пожаловать.")
+
+
+async def choose_user_mode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await render_ui(
         update,
         context,
-        "Добро пожаловать. Я сообщаю о начале Twitch и YouTube-эфиров.",
+        "Выбери режим работы:\n\n"
+        "🎙 Стример — настраивает уведомления в своих группах и каналах.\n"
+        "🔔 Подписчик — добавляет стримеров и получает уведомления в личку.",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🎙 Стример", callback_data="mode:set:streamer"
+                    ),
+                    InlineKeyboardButton(
+                        "🔔 Подписчик", callback_data="mode:set:subscriber"
+                    ),
+                ]
+            ]
+        ),
     )
 
 
@@ -287,6 +311,21 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(f"Не удалось добавить канал: {error}")
         return
 
+    if database.get_user_mode(user.id) == "subscriber":
+        database.connect_chat(user.id, user.full_name or str(user.id), user.id)
+        try:
+            database.add_subscription(
+                user.id, platform, channel_key, channel_name, channel_url
+            )
+        except sqlite3.IntegrityError:
+            await message.reply_text("Этот стример уже отслеживается.")
+            return
+        await message.reply_text(
+            f"Стример «{channel_name}» добавлен. Уведомление о новом эфире "
+            "придёт в этот личный чат."
+        )
+        return
+
     chats = database.list_user_chats(user.id)
     if not chats:
         await message.reply_text(
@@ -331,6 +370,23 @@ async def begin_subscription_from_url(
             update,
             context,
             f"Не удалось добавить канал: {error}\nПришли корректную ссылку или нажми «Отмена».",
+        )
+        return
+
+    if database.get_user_mode(update.effective_user.id) == "subscriber":
+        user = update.effective_user
+        database.connect_chat(user.id, user.full_name or str(user.id), user.id)
+        try:
+            database.add_subscription(
+                user.id, platform, channel_key, channel_name, channel_url
+            )
+        except sqlite3.IntegrityError:
+            await show_main_menu(update, context, "Этот стример уже отслеживается.")
+            return
+        await show_main_menu(
+            update,
+            context,
+            f"Стример «{channel_name}» добавлен. Уведомления придут в личку.",
         )
         return
 
@@ -1044,6 +1100,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data == "menu:home":
         await show_main_menu(update, context)
         return
+    if data == "menu:mode":
+        await choose_user_mode(update, context)
+        return
+    if data.startswith("mode:set:"):
+        mode = data.removeprefix("mode:set:")
+        if mode not in {"streamer", "subscriber"}:
+            await query.edit_message_text("Неизвестный режим.")
+            return
+        database.set_user_mode(update.effective_user.id, mode)
+        if mode == "subscriber":
+            user = update.effective_user
+            database.connect_chat(user.id, user.full_name or str(user.id), user.id)
+            text = (
+                "Режим подписчика включён. Добавляй стримеров — уведомления "
+                "о начале их эфиров придут в этот личный чат."
+            )
+        else:
+            text = (
+                "Режим стримера включён. Добавь бота администратором в группу "
+                "или канал и настраивай уведомления для него."
+            )
+        await show_main_menu(update, context, text)
+        return
     if data == "menu:help":
         await render_ui(
             update,
@@ -1270,6 +1349,9 @@ async def menu_text_handler(
     text = update.effective_message.text.strip()
     if text == MENU_CANCEL:
         await show_main_menu(update, context, "Действие отменено.")
+        return
+    if text == "🔄 Режим":
+        await choose_user_mode(update, context)
         return
     if text == MENU_ADD:
         clear_wizard(context)
@@ -3000,7 +3082,7 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             menu_callback,
-            pattern=r"^(menu|add|subscription|remove|appearance):",
+            pattern=r"^(menu|mode|add|subscription|remove|appearance):",
         )
     )
     application.add_handler(
