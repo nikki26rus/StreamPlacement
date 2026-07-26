@@ -19,6 +19,8 @@ class Database:
                 configured_by INTEGER NOT NULL,
                 notification_template TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}',
                 notification_description TEXT NOT NULL DEFAULT '',
+                notification_template_html TEXT,
+                notification_description_html TEXT,
                 preview_file_id TEXT,
                 discord_url TEXT,
                 button_emojis TEXT NOT NULL DEFAULT '{}',
@@ -79,6 +81,8 @@ class Database:
                 "TEXT NOT NULL DEFAULT '🔴 Новые эфиры: {count}'"
             ),
             "notification_description": "TEXT NOT NULL DEFAULT ''",
+            "notification_template_html": "TEXT",
+            "notification_description_html": "TEXT",
             "preview_file_id": "TEXT",
             "discord_url": "TEXT",
             "button_emojis": "TEXT NOT NULL DEFAULT '{}'",
@@ -253,7 +257,9 @@ class Database:
     def get_notification_settings(self, chat_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
             """
-            SELECT notification_template, notification_description, preview_file_id,
+            SELECT notification_template, notification_description,
+                   notification_template_html, notification_description_html,
+                   preview_file_id,
                    discord_url, button_emojis, button_custom_emoji_ids,
                    button_style, button_styles, custom_buttons, platform_button_groups,
                    blur_preview, preview_platform,
@@ -264,17 +270,29 @@ class Database:
             (chat_id,),
         ).fetchone()
 
-    def set_notification_template(self, chat_id: int, template: str) -> None:
+    def set_notification_template(
+        self, chat_id: int, template: str, html_template: str | None = None
+    ) -> None:
         self.connection.execute(
-            "UPDATE chats SET notification_template = ? WHERE chat_id = ?",
-            (template, chat_id),
+            """
+            UPDATE chats
+            SET notification_template = ?, notification_template_html = ?
+            WHERE chat_id = ?
+            """,
+            (template, html_template, chat_id),
         )
         self.connection.commit()
 
-    def set_notification_description(self, chat_id: int, description: str) -> None:
+    def set_notification_description(
+        self, chat_id: int, description: str, html_description: str | None = None
+    ) -> None:
         self.connection.execute(
-            "UPDATE chats SET notification_description = ? WHERE chat_id = ?",
-            (description, chat_id),
+            """
+            UPDATE chats
+            SET notification_description = ?, notification_description_html = ?
+            WHERE chat_id = ?
+            """,
+            (description, html_description, chat_id),
         )
         self.connection.commit()
 
@@ -664,6 +682,8 @@ class Database:
             UPDATE chats
             SET notification_template = '🔴 Новые эфиры: {count}',
                 notification_description = '',
+                notification_template_html = NULL,
+                notification_description_html = NULL,
                 preview_file_id = NULL,
                 discord_url = NULL,
                 button_emojis = '{}',
