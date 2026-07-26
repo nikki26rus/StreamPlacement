@@ -112,11 +112,6 @@ def main_menu(mode: str | None = None) -> ReplyKeyboardMarkup:
     )
 
 
-def main_inline_keyboard() -> InlineKeyboardMarkup:
-    """Очищает inline-клавиатуру: основные разделы находятся в Telegram Menu."""
-    return InlineKeyboardMarkup([])
-
-
 async def render_ui(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -323,9 +318,11 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except sqlite3.IntegrityError:
             await message.reply_text("Этот стример уже отслеживается.")
             return
-        await message.reply_text(
+        await show_main_menu(
+            update,
+            context,
             f"Стример «{channel_name}» добавлен. Уведомление о новом эфире "
-            "придёт в этот личный чат."
+            "придёт в этот личный чат.",
         )
         return
 
@@ -436,7 +433,7 @@ async def show_subscriptions_menu(
         update.effective_user.id, database.get_user_mode(update.effective_user.id)
     )
     if not subscriptions:
-        await render_ui(update, context, "Подписок пока нет.", main_inline_keyboard())
+        await show_main_menu(update, context, "Подписок пока нет.")
         return
 
     keyboard = [
@@ -527,8 +524,10 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         int(context.args[0]),
         database.get_user_mode(update.effective_user.id),
     )
-    await update.effective_message.reply_text(
-        "Подписка удалена." if removed else "Подписка с таким номером не найдена."
+    await show_main_menu(
+        update,
+        context,
+        "Подписка удалена." if removed else "Подписка с таким номером не найдена.",
     )
 
 
@@ -541,7 +540,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         update.effective_user.id, database.get_user_mode(update.effective_user.id)
     )
     if not subscriptions:
-        await render_ui(update, context, "У тебя нет доступных подписок.", main_inline_keyboard())
+        await show_main_menu(update, context, "У тебя нет доступных подписок.")
         return
 
     await render_ui(update, context, "Проверяю каналы…")
@@ -549,11 +548,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.application,
         only_subscription_ids={subscription["id"] for subscription in subscriptions},
     )
-    await render_ui(
-        update,
-        context,
-        "Результат проверки:\n" + "\n".join(results),
-        main_inline_keyboard(),
+    await show_main_menu(
+        update, context, "Результат проверки:\n" + "\n".join(results)
     )
 
 
@@ -1241,18 +1237,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             subscription_id,
             database.get_user_mode(update.effective_user.id),
         )
-        await query.edit_message_text(
+        await show_main_menu(
+            update,
+            context,
             "Подписка удалена." if removed else "Подписка уже удалена.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "К подпискам", callback_data="menu:subscriptions"
-                        )
-                    ],
-                    [InlineKeyboardButton("В меню", callback_data="menu:home")],
-                ]
-            ),
         )
         return
     if data == "menu:check":
@@ -1458,9 +1446,7 @@ async def menu_text_handler(
         chat_id = context.user_data["template_edit_chat_id"]
         database.set_notification_template(chat_id, text)
         clear_wizard(context)
-        await render_ui(
-            update, context, "Заголовок уведомления обновлён.", main_inline_keyboard()
-        )
+        await show_main_menu(update, context, "Заголовок уведомления обновлён.")
         return
     if wizard == "description_text":
         if len(text) > 350:
@@ -1480,9 +1466,7 @@ async def menu_text_handler(
         chat_id = context.user_data["description_edit_chat_id"]
         database.set_notification_description(chat_id, text)
         clear_wizard(context)
-        await render_ui(
-            update, context, "Описание уведомления обновлено.", main_inline_keyboard()
-        )
+        await show_main_menu(update, context, "Описание уведомления обновлено.")
         return
     if wizard == "discord_text":
         try:
@@ -1730,7 +1714,7 @@ async def menu_text_handler(
         )
         return
 
-    await render_ui(update, context, "Используй кнопки меню.", main_inline_keyboard())
+    await show_main_menu(update, context, "Используй кнопки меню.")
 
 
 async def select_target_chat(
@@ -1776,12 +1760,11 @@ async def select_target_chat(
     context.user_data.pop("pending_subscription", None)
     context.user_data.pop("wizard", None)
     context.user_data.pop("add_platform", None)
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         f"Готово: #{subscription_id} — {pending['channel_name']}.\n"
         "Первый опрос только запомнит текущий статус эфира.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В меню", callback_data="menu:home")]]
-        ),
     )
 
 
@@ -1825,13 +1808,12 @@ async def select_template_chat(
     database.set_notification_template(chat_id, template)
     context.user_data.pop("pending_template", None)
     context.user_data.pop("wizard", None)
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         "Заголовок уведомления сохранён.\n"
         "Предпросмотр: "
         f"{template.replace('{count}', '2').replace('{time}', '12:00')}",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
     )
 
 
@@ -1877,11 +1859,8 @@ async def select_description_chat(
     database.set_notification_description(chat_id, description)
     context.user_data.pop("pending_description", None)
     context.user_data.pop("wizard", None)
-    await query.edit_message_text(
-        "Описание сохранено. Оно появится в следующем уведомлении.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
+    await show_main_menu(
+        update, context, "Описание сохранено. Оно появится в следующем уведомлении."
     )
 
 
@@ -1940,11 +1919,10 @@ async def select_example_chat(
         await query.edit_message_text(f"Не удалось показать пример: {error}")
         return
 
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         "Пример отправлен сюда, в личный чат. Уведомление в канале не публиковалось.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
     )
 
 
@@ -1974,11 +1952,8 @@ async def select_discord_chat(
     database.add_custom_button(chat_id, "Discord", url)
     context.user_data.pop("pending_discord_url", None)
     context.user_data.pop("wizard", None)
-    await query.edit_message_text(
-        "Discord-ссылка сохранена как кастомная кнопка.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
+    await show_main_menu(
+        update, context, "Discord-ссылка сохранена как кастомная кнопка."
     )
 
 
@@ -1999,12 +1974,11 @@ async def select_preview_clear_chat(
         return
 
     database.clear_preview_file_id(chat_id)
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         "Своя картинка удалена. В следующем уведомлении будет использовано "
         "автоматическое превью.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
     )
 
 
@@ -2062,11 +2036,8 @@ async def set_preview_platform(
         await query.edit_message_text("Неизвестная площадка.")
         return
     label = "автовыбор" if platform == "auto" else PLATFORM_NAMES[platform]
-    await query.edit_message_text(
-        f"Источник автоматического превью: {label}.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
-        ),
+    await show_main_menu(
+        update, context, f"Источник автоматического превью: {label}."
     )
 
 
@@ -2188,11 +2159,11 @@ async def set_button_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Нет доступа к этому чату.")
         return
     database.set_button_style(chat_id, style)
-    await query.edit_message_text(
+    await render_ui(
+        update,
+        context,
         f"Цвет «{color_name}» сохранён для всех кнопок уведомления.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
-        ),
+        InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
     )
 
 
@@ -2537,19 +2508,11 @@ async def set_individual_button_color(
     except ValueError:
         await query.edit_message_text("Неизвестный цвет.")
         return
-    await query.edit_message_text(
+    await render_ui(
+        update,
+        context,
         "Цвет кнопки сохранён.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Назад к кнопкам",
-                        callback_data=f"individual_colors_chat:{chat_id}",
-                    )
-                ],
-                [InlineKeyboardButton("В оформление", callback_data="menu:appearance")],
-            ]
-        ),
+        InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
     )
 
 
@@ -2636,18 +2599,11 @@ async def delete_custom_button(
         await query.edit_message_text("Нет доступа к этому чату.")
         return
     deleted = database.remove_custom_button(chat_id, index)
-    await query.edit_message_text(
+    await render_ui(
+        update,
+        context,
         "Кнопка удалена." if deleted else "Эта кнопка уже удалена.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Назад к кнопкам",
-                        callback_data=f"button_settings_chat:{chat_id}",
-                    )
-                ],
-            ]
-        ),
+        InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
     )
 
 
@@ -2821,13 +2777,12 @@ async def toggle_preview_blur(
         await query.edit_message_text("Нет доступа к этому чату.")
         return
     enabled = database.toggle_preview_blur(chat_id)
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         "Блюр фона Twitch-превью включён. Аватар и обложка категории не размываются."
         if enabled
         else "Блюр фона Twitch-превью выключен.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Назад", callback_data="menu:appearance")]]
-        ),
     )
 
 
@@ -2882,11 +2837,10 @@ async def reset_notification_settings(
         return
     database.reset_notification_settings(chat_id)
     clear_wizard(context)
-    await render_ui(
+    await show_main_menu(
         update,
         context,
         "Настройки уведомлений сброшены до заводских. Подписки сохранены.",
-        main_inline_keyboard(),
     )
 
 
@@ -2914,11 +2868,10 @@ async def select_preview_chat(
     database.set_preview_file_id(chat_id, file_id)
     context.user_data.pop("pending_preview_file_id", None)
     context.user_data.pop("wizard", None)
-    await query.edit_message_text(
+    await show_main_menu(
+        update,
+        context,
         "Картинка сохранена. Она будет использована в следующем уведомлении.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("В оформление", callback_data="menu:appearance")]]
-        ),
     )
 
 
