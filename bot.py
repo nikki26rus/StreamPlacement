@@ -96,13 +96,18 @@ async def resolve_channel(
     raise ValueError(f"Неизвестная платформа: {platform}")
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
+def main_menu(mode: str | None = None) -> ReplyKeyboardMarkup:
+    rows = (
+        [[MENU_ADD, MENU_SUBSCRIPTIONS], [MENU_CHECK, MENU_HELP, "🔄 Режим"]]
+        if mode == "subscriber"
+        else [
             [MENU_ADD, MENU_SUBSCRIPTIONS],
             [MENU_CHECK, MENU_APPEARANCE],
             [MENU_HELP, "🔄 Режим"],
-        ],
+        ]
+    )
+    return ReplyKeyboardMarkup(
+        rows,
         resize_keyboard=True,
     )
 
@@ -116,7 +121,7 @@ async def render_ui(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
 ) -> None:
     """Показывает единственный актуальный экран навигации внизу переписки."""
     if update.effective_chat.type != "private":
@@ -174,11 +179,13 @@ async def show_main_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Выбери действие:"
 ) -> None:
     clear_wizard(context)
+    database: Database = context.application.bot_data["database"]
+    mode = database.get_user_mode(update.effective_user.id)
     await render_ui(
         update,
         context,
         f"{text}\n\nОсновные действия доступны в кнопке Menu рядом с полем ввода.",
-        main_inline_keyboard(),
+        main_menu(mode),
     )
 
 
@@ -199,10 +206,6 @@ def help_text() -> str:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Главные функции находятся на кнопках под полем ввода.",
-        reply_markup=main_menu(),
-    )
     database: Database = context.application.bot_data["database"]
     if not database.get_user_mode(update.effective_user.id):
         await choose_user_mode(update, context)
@@ -495,6 +498,13 @@ async def appearance_command(
 ) -> None:
     if update.effective_chat.type != "private":
         await update.effective_message.reply_text("Раздел доступен в личке с ботом.")
+        return
+    database: Database = context.application.bot_data["database"]
+    if database.get_user_mode(update.effective_user.id) == "subscriber":
+        await update.effective_message.reply_text(
+            "В режиме подписчика оформление недоступно: личные уведомления "
+            "формируются автоматически."
+        )
         return
     await show_appearance_menu(update, context)
 
@@ -1238,6 +1248,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await check_command(update, context)
         return
     if data == "menu:appearance":
+        if database.get_user_mode(update.effective_user.id) == "subscriber":
+            await show_main_menu(
+                update,
+                context,
+                "В режиме подписчика оформление недоступно.",
+            )
+            return
         await show_appearance_menu(update, context)
         return
     if data == "appearance:template":
@@ -1387,10 +1404,22 @@ async def menu_text_handler(
         await check_command(update, context)
         return
     if text == MENU_APPEARANCE:
+        database: Database = context.application.bot_data["database"]
+        if database.get_user_mode(update.effective_user.id) == "subscriber":
+            await show_main_menu(
+                update,
+                context,
+                "В режиме подписчика оформление недоступно.",
+            )
+            return
         await show_appearance_menu(update, context)
         return
     if text == MENU_HELP:
-        await update.effective_message.reply_text(help_text(), reply_markup=main_menu())
+        database: Database = context.application.bot_data["database"]
+        await update.effective_message.reply_text(
+            help_text(),
+            reply_markup=main_menu(database.get_user_mode(update.effective_user.id)),
+        )
         return
 
     wizard = context.user_data.get("wizard")
