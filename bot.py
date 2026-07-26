@@ -10,6 +10,7 @@ import httpx
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     MenuButtonDefault,
     ReplyKeyboardMarkup,
     Update,
@@ -102,7 +103,7 @@ def main_menu(mode: str | None = None) -> ReplyKeyboardMarkup:
         if mode == "subscriber"
         else [
             [MENU_ADD, MENU_SUBSCRIPTIONS],
-            [MENU_CHECK, MENU_APPEARANCE],
+            [MENU_CHECK, MENU_APPEARANCE, "📅 Расписание"],
             [MENU_HELP, "🔄 Режим"],
         ]
     )
@@ -168,6 +169,13 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "platform_group_subscription_id",
         "awaiting_preview",
         "pending_preview_file_id",
+        "awaiting_schedule_image",
+        "pending_schedule_image_file_id",
+        "schedule_chat_id",
+        "schedule_weekday",
+        "schedule_time",
+        "schedule_title",
+        "schedule_edit_item_id",
     ):
         context.user_data.pop(key, None)
 
@@ -277,7 +285,7 @@ def help_text(mode: str | None) -> str:
         "начались одновременно.\n\n"
         + common
         + "\n\nКоманды: /add, /chats, /list, /remove, /check, /template, "
-        "/preview, /topic и /start."
+        "/preview, /topic, /schedule_topic и /start."
     )
 
 
@@ -357,6 +365,32 @@ async def topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     database.set_notification_thread(chat.id, message.message_thread_id)
     await message.reply_text(
         "Готово. Уведомления для этого форума теперь будут приходить в эту тему."
+    )
+
+
+async def schedule_topic_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Привязывает публикации расписания к текущей теме форума."""
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat.type != "supergroup" or not chat.is_forum or not message.message_thread_id:
+        await message.reply_text(
+            "Открой нужную тему Telegram-форума и отправь в ней /schedule_topic."
+        )
+        return
+    database: Database = context.application.bot_data["database"]
+    if database.get_user_mode(update.effective_user.id) != "streamer":
+        await message.reply_text("Настройка расписания доступна в режиме стримера.")
+        return
+    if not database.is_configured(chat.id):
+        database.connect_chat(chat.id, chat.title or str(chat.id), update.effective_user.id)
+    if not database.user_can_access_chat(update.effective_user.id, chat.id):
+        await message.reply_text("Нет доступа к настройкам этого форума.")
+        return
+    database.set_schedule_thread_id(chat.id, message.message_thread_id)
+    await message.reply_text(
+        "Готово. Недельное расписание будет публиковаться в этой теме."
     )
 
 
@@ -715,6 +749,9 @@ async def receive_preview_photo(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     if update.effective_chat.type != "private":
+        return
+    if context.user_data.get("awaiting_schedule_image"):
+        await receive_schedule_image(update, context)
         return
     if not context.user_data.get("awaiting_preview"):
         await update.effective_message.reply_text(
@@ -1194,6 +1231,413 @@ async def choose_platform_group_target(
     )
 
 
+WEEKDAY_NAMES = (
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+)
+
+
+def schedule_preview_text(database: Database, chat_id: int, chat_title: str) -> str:
+    """Возвращает компактный недельный предпросмотр для экрана настройки."""
+    items_by_day: dict[int, list] = {weekday: [] for weekday in range(7)}
+    for item in database.list_schedule_items(chat_id):
+        items_by_day[item["weekday"]].append(item)
+
+    lines = [f"📅 Расписание · {chat_title}", ""]
+    for weekday, name in enumerate(WEEKDAY_NAMES):
+        lines.append(f"🗓 {name}")
+        if not items_by_day[weekday]:
+            lines.append("  — нет событий")
+            continue
+        for item in items_by_day[weekday]:
+            description = f"\n    {item['description']}" if item["description"] else ""
+            lines.append(f"  {item['time']} — {item['title']}{description}")
+    return "\n".join(lines)
+
+
+def schedule_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить", callback_data=f"schedule:add:{chat_id}"
+                ),
+                InlineKeyboardButton(
+                    "✏️ Изменить / удалить", callback_data=f"schedule:items:{chat_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🖼 Картинка", callback_data=f"schedule:image:{chat_id}"
+                ),
+                InlineKeyboardButton(
+                    "📤 Опубликовать расписание",
+                    callback_data=f"schedule:publish:{chat_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Сменить чат", callback_data="schedule:chats"
+                ),
+                InlineKeyboardButton("В меню", callback_data="menu:home"),
+            ],
+        ]
+    )
+
+
+async def show_schedule_chat_picker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    if database.get_user_mode(update.effective_user.id) != "streamer":
+        await show_main_menu(update, context, "Расписание доступно только в режиме стримера.")
+        return
+    chats = database.list_user_chats(update.effective_user.id)
+    if not chats:
+        await show_main_menu(
+            update,
+            context,
+            "Нет доступных каналов или групп. Добавь бота администратором и повтори.",
+        )
+        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                chat["title"], callback_data=f"schedule:open:{chat['chat_id']}"
+            )
+        ]
+        for chat in chats
+    ]
+    keyboard.append([InlineKeyboardButton("В меню", callback_data="menu:home")])
+    await render_ui(
+        update,
+        context,
+        "Выбери канал или группу для недельного расписания:",
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_schedule_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    database: Database = context.application.bot_data["database"]
+    if (
+        database.get_user_mode(update.effective_user.id) != "streamer"
+        or not database.user_can_access_chat(update.effective_user.id, chat_id)
+    ):
+        await show_main_menu(update, context, "Нет доступа к этому расписанию.")
+        return
+    chat = next(
+        (
+            item
+            for item in database.list_user_chats(update.effective_user.id)
+            if item["chat_id"] == chat_id
+        ),
+        None,
+    )
+    if not chat:
+        await show_main_menu(update, context, "Этот чат больше недоступен.")
+        return
+    context.user_data["schedule_chat_id"] = chat_id
+    await render_ui(
+        update,
+        context,
+        schedule_preview_text(database, chat_id, chat["title"]),
+        schedule_keyboard(chat_id),
+    )
+
+
+async def receive_schedule_image(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Сохраняет картинку расписания отдельно от картинок уведомлений."""
+    database: Database = context.application.bot_data["database"]
+    chat_id = context.user_data.get("schedule_chat_id")
+    if (
+        database.get_user_mode(update.effective_user.id) != "streamer"
+        or not isinstance(chat_id, int)
+        or not database.user_can_access_chat(update.effective_user.id, chat_id)
+    ):
+        clear_wizard(context)
+        await show_main_menu(update, context, "Нет доступа к этому расписанию.")
+        return
+    database.set_schedule_image_file_id(
+        chat_id, update.effective_message.photo[-1].file_id
+    )
+    context.user_data.pop("awaiting_schedule_image", None)
+    await show_schedule_menu(update, context, chat_id)
+
+
+async def publish_schedule(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> str:
+    """Публикует расписание, редактируя прошлую публикацию при возможности."""
+    database: Database = context.application.bot_data["database"]
+    items_by_day: dict[int, list] = {weekday: [] for weekday in range(7)}
+    for item in database.list_schedule_items(chat_id):
+        items_by_day[item["weekday"]].append(item)
+    if not any(items_by_day.values()):
+        return "Добавь хотя бы один пункт перед публикацией."
+
+    lines = ["📅 <b>Расписание на неделю</b>"]
+    for weekday, name in enumerate(WEEKDAY_NAMES):
+        if not items_by_day[weekday]:
+            continue
+        lines.extend(("", f"<b>{name}</b>"))
+        for item in items_by_day[weekday]:
+            title = html.escape(item["title"])
+            description = html.escape(item["description"])
+            lines.append(f"• <b>{item['time']}</b> — {title}")
+            if description:
+                lines.append(f"  {description}")
+    text = "\n".join(lines)
+    image_file_id = database.get_schedule_image_file_id(chat_id)
+    previous = database.get_schedule_message(chat_id)
+    thread_id = database.get_schedule_thread_id(chat_id)
+
+    async def delete_previous() -> None:
+        if not previous:
+            return
+        try:
+            await context.bot.delete_message(chat_id, previous["posted_message_id"])
+        except BadRequest:
+            pass
+
+    try:
+        if previous and previous["posted_message_has_photo"] and image_file_id and len(text) <= 1024:
+            message = await context.bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=previous["posted_message_id"],
+                media=InputMediaPhoto(
+                    image_file_id, caption=text, parse_mode=ParseMode.HTML
+                ),
+            )
+            database.set_schedule_message(chat_id, message.message_id, has_photo=True)
+            return "Расписание опубликовано: предыдущая публикация обновлена."
+        if previous and not previous["posted_message_has_photo"] and not image_file_id:
+            message = await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=previous["posted_message_id"],
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            database.set_schedule_message(chat_id, message.message_id, has_photo=False)
+            return "Расписание опубликовано: предыдущая публикация обновлена."
+    except BadRequest as error:
+        logger.info("Не удалось обновить публикацию расписания: %s", error)
+
+    await delete_previous()
+    try:
+        if image_file_id and len(text) <= 1024:
+            message = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=image_file_id,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=thread_id,
+            )
+            database.set_schedule_message(chat_id, message.message_id, has_photo=True)
+        else:
+            if image_file_id:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=image_file_id,
+                    message_thread_id=thread_id,
+                )
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                message_thread_id=thread_id,
+            )
+            database.set_schedule_message(chat_id, message.message_id, has_photo=False)
+    except BadRequest as error:
+        logger.warning("Не удалось опубликовать расписание в %s: %s", chat_id, error)
+        return f"Не удалось опубликовать расписание: {error}"
+    return "Расписание опубликовано."
+
+
+async def schedule_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    database: Database = context.application.bot_data["database"]
+    if database.get_user_mode(update.effective_user.id) != "streamer":
+        await show_main_menu(update, context, "Расписание доступно только в режиме стримера.")
+        return
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "chats":
+        clear_wizard(context)
+        await show_schedule_chat_picker(update, context)
+        return
+    try:
+        chat_id = int(parts[2])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Некорректное действие расписания.")
+        return
+    if not database.user_can_access_chat(update.effective_user.id, chat_id):
+        await query.edit_message_text("Нет доступа к этому чату.")
+        return
+    context.user_data["schedule_chat_id"] = chat_id
+    if action == "open":
+        await show_schedule_menu(update, context, chat_id)
+        return
+    if action == "add":
+        context.user_data["wizard"] = "schedule_day"
+        context.user_data.pop("schedule_edit_item_id", None)
+        keyboard = [
+            [InlineKeyboardButton(name, callback_data=f"schedule:day:{chat_id}:{day}")]
+            for day, name in enumerate(WEEKDAY_NAMES)
+        ]
+        keyboard.append([InlineKeyboardButton("Назад", callback_data=f"schedule:open:{chat_id}")])
+        await render_ui(update, context, "Выбери день недели:", InlineKeyboardMarkup(keyboard))
+        return
+    if action == "day":
+        try:
+            weekday = int(parts[3])
+        except (IndexError, ValueError):
+            await query.edit_message_text("Некорректный день недели.")
+            return
+        if not 0 <= weekday <= 6:
+            await query.edit_message_text("Некорректный день недели.")
+            return
+        context.user_data["schedule_weekday"] = weekday
+        context.user_data["wizard"] = "schedule_time"
+        await render_ui(
+            update,
+            context,
+            f"{WEEKDAY_NAMES[weekday]}. Пришли время в формате ЧЧ:ММ, например 19:30.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Назад", callback_data=f"schedule:add:{chat_id}")]]
+            ),
+        )
+        return
+    if action == "items":
+        items = database.list_schedule_items(chat_id)
+        if not items:
+            await show_schedule_menu(update, context, chat_id)
+            return
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"{WEEKDAY_NAMES[item['weekday']]} · {item['time']} · {item['title'][:28]}",
+                    callback_data=f"schedule:item:{chat_id}:{item['id']}",
+                )
+            ]
+            for item in items
+        ]
+        keyboard.append([InlineKeyboardButton("Назад", callback_data=f"schedule:open:{chat_id}")])
+        await render_ui(update, context, "Выбери пункт расписания:", InlineKeyboardMarkup(keyboard))
+        return
+    try:
+        item_id = int(parts[3])
+    except (IndexError, ValueError):
+        item_id = 0
+    item = next((row for row in database.list_schedule_items(chat_id) if row["id"] == item_id), None)
+    if action == "item":
+        if not item:
+            await query.edit_message_text("Этот пункт уже удалён.")
+            return
+        description = item["description"] or "—"
+        await render_ui(
+            update,
+            context,
+            f"{WEEKDAY_NAMES[item['weekday']]}, {item['time']}\n"
+            f"{item['title']}\n{description}",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✏️ Изменить", callback_data=f"schedule:edit:{chat_id}:{item_id}")],
+                    [InlineKeyboardButton("🗑 Удалить", callback_data=f"schedule:delete_ask:{chat_id}:{item_id}")],
+                    [InlineKeyboardButton("Назад", callback_data=f"schedule:items:{chat_id}")],
+                ]
+            ),
+        )
+        return
+    if action == "edit":
+        if not item:
+            await query.edit_message_text("Этот пункт уже удалён.")
+            return
+        context.user_data["schedule_edit_item_id"] = item_id
+        context.user_data["wizard"] = "schedule_day"
+        keyboard = [
+            [InlineKeyboardButton(name, callback_data=f"schedule:day:{chat_id}:{day}")]
+            for day, name in enumerate(WEEKDAY_NAMES)
+        ]
+        keyboard.append([InlineKeyboardButton("Назад", callback_data=f"schedule:item:{chat_id}:{item_id}")])
+        await render_ui(
+            update,
+            context,
+            f"Изменение «{item['title']}». Выбери новый день:",
+            InlineKeyboardMarkup(keyboard),
+        )
+        return
+    if action == "delete_ask":
+        if not item:
+            await query.edit_message_text("Этот пункт уже удалён.")
+            return
+        await render_ui(
+            update,
+            context,
+            f"Удалить «{item['title']}»?",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Да, удалить", callback_data=f"schedule:delete:{chat_id}:{item_id}")],
+                    [InlineKeyboardButton("Нет", callback_data=f"schedule:item:{chat_id}:{item_id}")],
+                ]
+            ),
+        )
+        return
+    if action == "delete":
+        database.delete_schedule_item(chat_id, item_id)
+        await show_schedule_menu(update, context, chat_id)
+        return
+    if action == "image":
+        has_image = bool(database.get_schedule_image_file_id(chat_id))
+        buttons = [[InlineKeyboardButton("🖼 Загрузить / заменить", callback_data=f"schedule:image_upload:{chat_id}")]]
+        if has_image:
+            buttons.append([InlineKeyboardButton("🗑 Удалить картинку", callback_data=f"schedule:image_clear:{chat_id}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data=f"schedule:open:{chat_id}")])
+        await render_ui(
+            update,
+            context,
+            "Картинка расписания " + ("установлена." if has_image else "не установлена."),
+            InlineKeyboardMarkup(buttons),
+        )
+        return
+    if action == "image_upload":
+        clear_wizard(context)
+        context.user_data["schedule_chat_id"] = chat_id
+        context.user_data["awaiting_schedule_image"] = True
+        await render_ui(
+            update,
+            context,
+            "Пришли картинку как фото.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data=f"schedule:image:{chat_id}")]]
+            ),
+        )
+        return
+    if action == "image_clear":
+        database.set_schedule_image_file_id(chat_id, None)
+        await show_schedule_menu(update, context, chat_id)
+        return
+    if action == "publish":
+        result = await publish_schedule(update, context, chat_id)
+        await show_schedule_menu(update, context, chat_id)
+        await update.effective_message.reply_text(result)
+        return
+    await query.edit_message_text("Неизвестное действие расписания.")
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1502,6 +1946,10 @@ async def menu_text_handler(
             )
             return
         await show_appearance_menu(update, context)
+        return
+    if text == "📅 Расписание":
+        clear_wizard(context)
+        await show_schedule_chat_picker(update, context)
         return
     if text == MENU_HELP:
         database: Database = context.application.bot_data["database"]
@@ -1813,6 +2261,85 @@ async def menu_text_handler(
             "Группа кнопки площадки сохранена.",
             InlineKeyboardMarkup(button_manager_rows(database, chat_id)),
         )
+        return
+    if wizard == "schedule_time":
+        if (
+            len(text) != 5
+            or text[2] != ":"
+            or not text[:2].isdigit()
+            or not text[3:].isdigit()
+            or not 0 <= int(text[:2]) <= 23
+            or not 0 <= int(text[3:]) <= 59
+        ):
+            await update.effective_message.reply_text(
+                "Время нужно указать в формате ЧЧ:ММ, например 19:30."
+            )
+            return
+        context.user_data["schedule_time"] = text
+        context.user_data["wizard"] = "schedule_title"
+        await render_ui(
+            update,
+            context,
+            "Пришли название события (до 100 символов).",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:home")]]
+            ),
+        )
+        return
+    if wizard == "schedule_title":
+        if not text or len(text) > 100:
+            await update.effective_message.reply_text(
+                "Название должно содержать от 1 до 100 символов."
+            )
+            return
+        context.user_data["schedule_title"] = text
+        context.user_data["wizard"] = "schedule_description"
+        await render_ui(
+            update,
+            context,
+            "Пришли описание (до 300 символов) или «-», чтобы оставить пустым.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Отмена", callback_data="menu:home")]]
+            ),
+        )
+        return
+    if wizard == "schedule_description":
+        if len(text) > 300:
+            await update.effective_message.reply_text(
+                "Описание должно быть не длиннее 300 символов."
+            )
+            return
+        database: Database = context.application.bot_data["database"]
+        chat_id = context.user_data.get("schedule_chat_id")
+        weekday = context.user_data.get("schedule_weekday")
+        schedule_time = context.user_data.get("schedule_time")
+        title = context.user_data.get("schedule_title")
+        if (
+            database.get_user_mode(update.effective_user.id) != "streamer"
+            or not isinstance(chat_id, int)
+            or not isinstance(weekday, int)
+            or not isinstance(schedule_time, str)
+            or not isinstance(title, str)
+            or not database.user_can_access_chat(update.effective_user.id, chat_id)
+        ):
+            await show_main_menu(update, context, "Расписание больше недоступно.")
+            return
+        description = "" if text == "-" else text
+        item_id = context.user_data.get("schedule_edit_item_id")
+        if isinstance(item_id, int):
+            changed = database.update_schedule_item(
+                chat_id, item_id, weekday, schedule_time, title, description
+            )
+            message = "Пункт расписания обновлён." if changed else "Этот пункт уже удалён."
+        else:
+            database.add_schedule_item(
+                chat_id, weekday, schedule_time, title, description
+            )
+            message = "Пункт расписания добавлен."
+        clear_wizard(context)
+        context.user_data["schedule_chat_id"] = chat_id
+        await show_schedule_menu(update, context, chat_id)
+        await update.effective_message.reply_text(message)
         return
 
     await show_main_menu(update, context, "Используй кнопки меню.")
@@ -3178,6 +3705,7 @@ def main() -> None:
     application.add_handler(CommandHandler("template", template_command))
     application.add_handler(CommandHandler("preview", preview_command))
     application.add_handler(CommandHandler("topic", topic_command))
+    application.add_handler(CommandHandler("schedule_topic", schedule_topic_command))
     application.add_handler(MessageHandler(filters.PHOTO, receive_preview_photo))
     application.add_handler(
         CallbackQueryHandler(
@@ -3294,6 +3822,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(select_preview_chat, pattern=r"^preview_chat:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(schedule_callback, pattern=r"^schedule:")
     )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler)
