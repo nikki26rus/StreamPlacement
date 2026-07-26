@@ -102,6 +102,8 @@ def format_live_notification(
     description: str,
     *,
     count_override: int | None = None,
+    template_is_html: bool = False,
+    description_is_html: bool = False,
 ) -> str:
     replacements = {
         "{count}": str(
@@ -140,10 +142,10 @@ def format_live_notification(
     for placeholder, value in replacements.items():
         template = template.replace(placeholder, value)
         description = description.replace(placeholder, value)
-    header = html.escape(template)
+    header = template if template_is_html else html.escape(template)
     lines = [f"<b>{header}</b>"]
     if description:
-        lines.append(html.escape(description))
+        lines.append(description if description_is_html else html.escape(description))
     return "\n\n".join(lines)
 
 
@@ -290,8 +292,12 @@ async def send_or_edit_notification(
     else:
         text = format_live_notification(
             notifications,
-            settings["notification_template"],
-            settings["notification_description"],
+            settings["notification_template_html"]
+            or settings["notification_template"],
+            settings["notification_description_html"]
+            or settings["notification_description"],
+            template_is_html=bool(settings["notification_template_html"]),
+            description_is_html=bool(settings["notification_description_html"]),
         )
     reply_markup = notification_keyboard(
         database.get_chat_subscriptions(chat_id),
