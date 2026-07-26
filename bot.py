@@ -432,7 +432,9 @@ async def show_subscriptions_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     database: Database = context.application.bot_data["database"]
-    subscriptions = database.list_user_subscriptions(update.effective_user.id)
+    subscriptions = database.list_user_subscriptions(
+        update.effective_user.id, database.get_user_mode(update.effective_user.id)
+    )
     if not subscriptions:
         await render_ui(update, context, "Подписок пока нет.", main_inline_keyboard())
         return
@@ -461,7 +463,9 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     database: Database = context.application.bot_data["database"]
-    subscriptions = database.list_user_subscriptions(update.effective_user.id)
+    subscriptions = database.list_user_subscriptions(
+        update.effective_user.id, database.get_user_mode(update.effective_user.id)
+    )
     if not subscriptions:
         await update.effective_message.reply_text(
             "Подписок пока нет. Добавь канал: /add twitch <ссылка>"
@@ -519,7 +523,9 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     database: Database = context.application.bot_data["database"]
     removed = database.remove_user_subscription(
-        update.effective_user.id, int(context.args[0])
+        update.effective_user.id,
+        int(context.args[0]),
+        database.get_user_mode(update.effective_user.id),
     )
     await update.effective_message.reply_text(
         "Подписка удалена." if removed else "Подписка с таким номером не найдена."
@@ -531,7 +537,9 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("Проверка доступна в личке с ботом.")
         return
     database: Database = context.application.bot_data["database"]
-    subscriptions = database.list_user_subscriptions(update.effective_user.id)
+    subscriptions = database.list_user_subscriptions(
+        update.effective_user.id, database.get_user_mode(update.effective_user.id)
+    )
     if not subscriptions:
         await render_ui(update, context, "У тебя нет доступных подписок.", main_inline_keyboard())
         return
@@ -1183,7 +1191,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if data.startswith("subscription:"):
         subscription_id = int(data.removeprefix("subscription:"))
-        subscriptions = database.list_user_subscriptions(update.effective_user.id)
+        subscriptions = database.list_user_subscriptions(
+            update.effective_user.id, database.get_user_mode(update.effective_user.id)
+        )
         subscription = next(
             (item for item in subscriptions if item["id"] == subscription_id), None
         )
@@ -1227,7 +1237,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data.startswith("remove:confirm:"):
         subscription_id = int(data.removeprefix("remove:confirm:"))
         removed = database.remove_user_subscription(
-            update.effective_user.id, subscription_id
+            update.effective_user.id,
+            subscription_id,
+            database.get_user_mode(update.effective_user.id),
         )
         await query.edit_message_text(
             "Подписка удалена." if removed else "Подписка уже удалена.",
