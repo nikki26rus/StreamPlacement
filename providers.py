@@ -184,10 +184,14 @@ class StreamProviders:
         if path.startswith("channel/"):
             channel_id = path.split("/", 1)[1].split("/", 1)[0]
             source_url = f"https://www.youtube.com/channel/{channel_id}"
-        elif path.startswith(("@", "c/", "user/")):
-            source_url = f"https://www.youtube.com/{path.split('/', 2)[0]}"
-            if path.startswith(("c/", "user/")):
-                source_url = f"https://www.youtube.com/{path.split('/', 2)[0]}/{path.split('/', 2)[1]}"
+        elif path.startswith("@"):
+            # YouTube часто не отдаёт внутренний UC-ID для handle-страниц
+            # серверным клиентам. Handle стабилен и работает с /live напрямую.
+            channel_id = path.split("/", 1)[0]
+            source_url = f"https://www.youtube.com/{channel_id}"
+        elif path.startswith(("c/", "user/")):
+            channel_id = "/".join(path.split("/", 2)[:2])
+            source_url = f"https://www.youtube.com/{channel_id}"
         else:
             raise ValueError(
                 "Поддерживаются ссылки вида youtube.com/channel/UC... "
@@ -204,11 +208,16 @@ class StreamProviders:
             )
         title_match = re.search(r'<meta property="og:title" content="([^"]+)"', response.text)
         title = html.unescape(title_match.group(1)) if title_match else channel_id
-        return channel_id, title, f"https://www.youtube.com/channel/{channel_id}"
+        return channel_id, title, source_url
 
     async def youtube_live(self, channel_id: str) -> LiveStream | None:
+        channel_path = (
+            channel_id
+            if channel_id.startswith(("@", "c/", "user/"))
+            else f"channel/{channel_id}"
+        )
         response = await self.scrape_client.get(
-            f"https://www.youtube.com/channel/{channel_id}/live"
+            f"https://www.youtube.com/{channel_path}/live"
         )
         response.raise_for_status()
         canonical = re.search(
