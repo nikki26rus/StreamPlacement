@@ -11,6 +11,12 @@ class PublicPlatformUrlTests(unittest.TestCase):
             "club123",
         )
         self.assertEqual(
+            parse_public_platform_url(
+                "vk", "https://live.vkvideo.ru/wildmerry"
+            ),
+            "wildmerry",
+        )
+        self.assertEqual(
             parse_public_platform_url("rutube", "https://rutube.ru/channel/12345/"),
             "12345",
         )
@@ -24,6 +30,10 @@ class PublicPlatformUrlTests(unittest.TestCase):
         )
 
     def test_builds_live_urls(self) -> None:
+        self.assertEqual(
+            public_channel_url("vk", "wildmerry"),
+            "https://live.vkvideo.ru/wildmerry",
+        )
         self.assertEqual(
             public_channel_url("instagram", "example", live=True),
             "https://www.instagram.com/example/live/",
