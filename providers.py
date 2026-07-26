@@ -62,6 +62,22 @@ def parse_public_live_page(platform: str, body: str, url: str) -> LiveStream | N
     )
 
 
+def extract_youtube_channel_id(body: str) -> str | None:
+    """Извлекает ID канала из нескольких вариантов разметки YouTube."""
+    patterns = (
+        r'"externalId":"(UC[\w-]{20,})"',
+        r'"channelId":"(UC[\w-]{20,})"',
+        r'\\"(?:externalId|channelId)\\":\\"(UC[\w-]{20,})\\"',
+        r'<meta itemprop="channelId" content="(UC[\w-]{20,})"',
+        r'<link rel="canonical" href="https?://www\.youtube\.com/channel/(UC[\w-]{20,})',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, body)
+        if match:
+            return match.group(1)
+    return None
+
+
 class StreamProviders:
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -160,29 +176,32 @@ class StreamProviders:
     async def youtube_channel_id(self, url: str) -> tuple[str, str, str]:
         parsed = urlparse(url)
         host = parsed.netloc.lower().removeprefix("www.")
-        if host not in {"youtube.com", "m.youtube.com"}:
+        if host not in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
             raise ValueError("Нужна ссылка на канал YouTube")
 
         path = parsed.path.strip("/")
         channel_id = ""
         if path.startswith("channel/"):
             channel_id = path.split("/", 1)[1].split("/", 1)[0]
-        elif path.startswith("@"):
-            response = await self.scrape_client.get(f"https://www.youtube.com/{path.split('/', 1)[0]}")
-            response.raise_for_status()
-            match = re.search(r'"externalId":"(UC[\w-]+)"', response.text)
-            if not match:
-                raise ValueError("Не удалось определить ID канала YouTube")
-            channel_id = match.group(1)
+            source_url = f"https://www.youtube.com/channel/{channel_id}"
+        elif path.startswith(("@", "c/", "user/")):
+            source_url = f"https://www.youtube.com/{path.split('/', 2)[0]}"
+            if path.startswith(("c/", "user/")):
+                source_url = f"https://www.youtube.com/{path.split('/', 2)[0]}/{path.split('/', 2)[1]}"
         else:
             raise ValueError(
                 "Поддерживаются ссылки вида youtube.com/channel/UC... "
                 "или youtube.com/@название"
             )
-        response = await self.scrape_client.get(
-            f"https://www.youtube.com/channel/{channel_id}"
-        )
+        response = await self.scrape_client.get(source_url)
         response.raise_for_status()
+        if not channel_id:
+            channel_id = extract_youtube_channel_id(response.text) or ""
+        if not channel_id:
+            raise ValueError(
+                "Не удалось определить ID канала YouTube. "
+                "Попробуй ссылку вида youtube.com/channel/UC..."
+            )
         title_match = re.search(r'<meta property="og:title" content="([^"]+)"', response.text)
         title = html.unescape(title_match.group(1)) if title_match else channel_id
         return channel_id, title, f"https://www.youtube.com/channel/{channel_id}"
