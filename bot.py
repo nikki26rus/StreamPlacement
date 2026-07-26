@@ -148,7 +148,9 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "wizard",
         "pending_subscription",
         "pending_template",
+        "pending_template_html",
         "pending_description",
+        "pending_description_html",
         "template_edit_chat_id",
         "description_edit_chat_id",
         "pending_discord_url",
@@ -168,6 +170,62 @@ def clear_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_preview_file_id",
     ):
         context.user_data.pop(key, None)
+
+
+def telegram_html_from_message(message) -> str:
+    """Преобразует разрешённые Telegram-сущности сообщения в безопасный HTML."""
+    text = message.text or ""
+    entities = message.entities or ()
+
+    def python_index(utf16_offset: int) -> int:
+        units = 0
+        for index, character in enumerate(text):
+            if units >= utf16_offset:
+                return index
+            units += len(character.encode("utf-16-le")) // 2
+        return len(text)
+
+    tags = {
+        "bold": ("<b>", "</b>"),
+        "italic": ("<i>", "</i>"),
+        "underline": ("<u>", "</u>"),
+        "strikethrough": ("<s>", "</s>"),
+        "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
+        "code": ("<code>", "</code>"),
+        "pre": ("<pre>", "</pre>"),
+        "blockquote": ("<blockquote>", "</blockquote>"),
+        "expandable_blockquote": (
+            "<blockquote expandable>",
+            "</blockquote>",
+        ),
+    }
+    openings: dict[int, list[tuple[int, str]]] = {}
+    closings: dict[int, list[tuple[int, str]]] = {}
+    for entity in entities:
+        entity_type = getattr(entity.type, "value", entity.type)
+        start = python_index(entity.offset)
+        end = python_index(entity.offset + entity.length)
+        opening = closing = None
+        if entity_type in tags:
+            opening, closing = tags[entity_type]
+        elif entity_type == "text_link" and entity.url:
+            opening = f'<a href="{html.escape(entity.url, quote=True)}">'
+            closing = "</a>"
+        elif entity_type == "custom_emoji" and entity.custom_emoji_id:
+            opening = f'<tg-emoji emoji-id="{entity.custom_emoji_id}">'
+            closing = "</tg-emoji>"
+        if opening and closing and start < end:
+            openings.setdefault(start, []).append((end, opening))
+            closings.setdefault(end, []).append((start, closing))
+
+    chunks = []
+    for index, character in enumerate(text):
+        for _, tag in sorted(openings.get(index, []), reverse=True):
+            chunks.append(tag)
+        chunks.append(html.escape(character))
+        for _, tag in sorted(closings.get(index + 1, []), reverse=True):
+            chunks.append(tag)
+    return "".join(chunks)
 
 
 async def show_main_menu(
@@ -747,7 +805,10 @@ async def show_appearance_menu(
 
 
 async def choose_template_target(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, template: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    template: str,
+    html_template: str,
 ) -> None:
     database: Database = context.application.bot_data["database"]
     chats = database.list_user_chats(update.effective_user.id)
@@ -756,6 +817,7 @@ async def choose_template_target(
         return
 
     context.user_data["pending_template"] = template
+    context.user_data["pending_template_html"] = html_template
     context.user_data["wizard"] = "template_target"
     keyboard = [
         [
@@ -799,7 +861,10 @@ async def choose_template_edit_target(
 
 
 async def choose_description_target(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, description: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    description: str,
+    html_description: str,
 ) -> None:
     database: Database = context.application.bot_data["database"]
     chats = database.list_user_chats(update.effective_user.id)
@@ -808,6 +873,7 @@ async def choose_description_target(
         return
 
     context.user_data["pending_description"] = description
+    context.user_data["pending_description_html"] = html_description
     context.user_data["wizard"] = "description_target"
     keyboard = [
         [
@@ -1458,7 +1524,9 @@ async def menu_text_handler(
                 "Текст слишком длинный: максимум 300 символов. Пришли другой."
             )
             return
-        await choose_template_target(update, context, text)
+        await choose_template_target(
+            update, context, text, telegram_html_from_message(update.effective_message)
+        )
         return
     if wizard == "template_edit_text":
         if len(text) > 300:
@@ -1468,7 +1536,9 @@ async def menu_text_handler(
             return
         database: Database = context.application.bot_data["database"]
         chat_id = context.user_data["template_edit_chat_id"]
-        database.set_notification_template(chat_id, text)
+        database.set_notification_template(
+            chat_id, text, telegram_html_from_message(update.effective_message)
+        )
         clear_wizard(context)
         await show_main_menu(update, context, "Заголовок уведомления обновлён.")
         return
@@ -1478,7 +1548,12 @@ async def menu_text_handler(
                 "Описание слишком длинное: максимум 350 символов. Пришли другой текст."
             )
             return
-        await choose_description_target(update, context, text)
+        await choose_description_target(
+            update,
+            context,
+            text,
+            telegram_html_from_message(update.effective_message),
+        )
         return
     if wizard == "description_edit_text":
         if len(text) > 350:
@@ -1488,7 +1563,9 @@ async def menu_text_handler(
             return
         database: Database = context.application.bot_data["database"]
         chat_id = context.user_data["description_edit_chat_id"]
-        database.set_notification_description(chat_id, text)
+        database.set_notification_description(
+            chat_id, text, telegram_html_from_message(update.effective_message)
+        )
         clear_wizard(context)
         await show_main_menu(update, context, "Описание уведомления обновлено.")
         return
@@ -1798,6 +1875,7 @@ async def select_template_chat(
     query = update.callback_query
     await query.answer()
     template = context.user_data.get("pending_template")
+    html_template = context.user_data.get("pending_template_html")
     if not query.data.startswith("template_chat:"):
         await query.edit_message_text("Эта кнопка уже неактуальна. Повтори /template.")
         return
@@ -1829,7 +1907,7 @@ async def select_template_chat(
         )
         return
 
-    database.set_notification_template(chat_id, template)
+    database.set_notification_template(chat_id, template, html_template)
     context.user_data.pop("pending_template", None)
     context.user_data.pop("wizard", None)
     await show_main_menu(
@@ -1847,6 +1925,7 @@ async def select_description_chat(
     query = update.callback_query
     await query.answer()
     description = context.user_data.get("pending_description")
+    html_description = context.user_data.get("pending_description_html")
     if not query.data.startswith("description_chat:"):
         await query.edit_message_text(
             "Эта кнопка уже неактуальна. Открой «Оформление» заново."
@@ -1880,7 +1959,7 @@ async def select_description_chat(
         )
         return
 
-    database.set_notification_description(chat_id, description)
+    database.set_notification_description(chat_id, description, html_description)
     context.user_data.pop("pending_description", None)
     context.user_data.pop("wizard", None)
     await show_main_menu(
@@ -1907,9 +1986,12 @@ async def select_example_chat(
     settings = database.get_notification_settings(chat_id)
     text = format_live_notification(
         [],
-        settings["notification_template"],
-        settings["notification_description"],
+        settings["notification_template_html"] or settings["notification_template"],
+        settings["notification_description_html"]
+        or settings["notification_description"],
         count_override=1,
+        template_is_html=bool(settings["notification_template_html"]),
+        description_is_html=bool(settings["notification_description_html"]),
     )
     sample_keyboard = notification_keyboard(
         database.get_chat_subscriptions(chat_id),
