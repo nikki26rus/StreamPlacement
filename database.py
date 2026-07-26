@@ -690,9 +690,21 @@ class Database:
             "SELECT * FROM subscriptions WHERE chat_id = ? ORDER BY id", (chat_id,)
         ).fetchall()
 
-    def list_user_subscriptions(self, user_id: int) -> list[sqlite3.Row]:
+    def list_user_subscriptions(
+        self, user_id: int, mode: str | None = None
+    ) -> list[sqlite3.Row]:
+        mode_filter = (
+            "AND subscriptions.chat_id = ?"
+            if mode == "subscriber"
+            else "AND subscriptions.chat_id != ?"
+            if mode == "streamer"
+            else ""
+        )
+        parameters: tuple[int, ...] = (
+            (user_id, user_id) if mode_filter else (user_id,)
+        )
         return self.connection.execute(
-            """
+            f"""
             SELECT
                 subscriptions.id,
                 subscriptions.platform,
@@ -704,10 +716,11 @@ class Database:
             INNER JOIN chats ON chats.chat_id = subscriptions.chat_id
             INNER JOIN chat_access ON chat_access.chat_id = chats.chat_id
             WHERE chat_access.user_id = ?
+              {mode_filter}
             ORDER BY chats.title COLLATE NOCASE, subscriptions.platform,
                      subscriptions.channel_name COLLATE NOCASE
             """,
-            (user_id,),
+            parameters,
         ).fetchall()
 
     def get_all_subscriptions(self) -> list[sqlite3.Row]:
@@ -723,16 +736,31 @@ class Database:
         self.connection.commit()
         return cursor.rowcount > 0
 
-    def remove_user_subscription(self, user_id: int, subscription_id: int) -> bool:
+    def remove_user_subscription(
+        self, user_id: int, subscription_id: int, mode: str | None = None
+    ) -> bool:
+        mode_filter = (
+            "AND chat_id = ?"
+            if mode == "subscriber"
+            else "AND chat_id != ?"
+            if mode == "streamer"
+            else ""
+        )
+        parameters: tuple[int, ...] = (
+            (subscription_id, user_id, user_id)
+            if mode_filter
+            else (subscription_id, user_id)
+        )
         cursor = self.connection.execute(
-            """
+            f"""
             DELETE FROM subscriptions
             WHERE id = ?
               AND chat_id IN (
                   SELECT chat_id FROM chat_access WHERE user_id = ?
               )
+              {mode_filter}
             """,
-            (subscription_id, user_id),
+            parameters,
         )
         self.connection.commit()
         return cursor.rowcount > 0
