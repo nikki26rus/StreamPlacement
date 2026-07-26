@@ -417,7 +417,7 @@ def parse_public_platform_url(platform: str, url: str) -> str:
     host = parsed.netloc.lower().removeprefix("www.")
     path = parsed.path.strip("/")
     hosts = {
-        "vk": {"vk.com", "vkvideo.ru"},
+        "vk": {"vk.com", "vkvideo.ru", "live.vkvideo.ru"},
         "rutube": {"rutube.ru"},
         "instagram": {"instagram.com"},
         "tiktok": {"tiktok.com"},
@@ -437,7 +437,7 @@ def parse_public_platform_url(platform: str, url: str) -> str:
 
 def public_channel_url(platform: str, key: str, *, live: bool = False) -> str:
     base = {
-        "vk": f"https://vk.com/{key}",
+        "vk": f"https://live.vkvideo.ru/{key}",
         "rutube": f"https://rutube.ru/channel/{key}/",
         "instagram": f"https://www.instagram.com/{key}/",
         "tiktok": f"https://www.tiktok.com/@{key}",
