@@ -62,6 +62,12 @@ class Database:
                 PRIMARY KEY(chat_id, user_id),
                 FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL CHECK(mode IN ('streamer', 'subscriber')),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         chat_columns = {
@@ -153,6 +159,27 @@ class Database:
             VALUES (?, ?)
             """,
             (chat_id, user_id),
+        )
+        self.connection.commit()
+
+    def get_user_mode(self, user_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT mode FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return str(row["mode"]) if row else None
+
+    def set_user_mode(self, user_id: int, mode: str) -> None:
+        if mode not in {"streamer", "subscriber"}:
+            raise ValueError("Неизвестный режим")
+        self.connection.execute(
+            """
+            INSERT INTO user_profiles(user_id, mode)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                mode = excluded.mode,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, mode),
         )
         self.connection.commit()
 
