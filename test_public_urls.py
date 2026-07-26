@@ -1,7 +1,7 @@
 import unittest
 
 from bot import parse_public_platform_url, public_channel_url
-from providers import parse_public_live_page
+from providers import extract_youtube_channel_id, parse_public_live_page
 
 
 class PublicPlatformUrlTests(unittest.TestCase):
@@ -55,6 +55,19 @@ class PublicPlatformUrlTests(unittest.TestCase):
                 '"is_live":false,"broadcast_id":"123456789"',
                 "https://www.instagram.com/example/live/",
             )
+        )
+
+    def test_extracts_youtube_channel_id_from_page_variants(self) -> None:
+        channel_id = "UCabcdefghijklmnopqrstuv"
+        self.assertEqual(
+            extract_youtube_channel_id(f'"externalId":"{channel_id}"'),
+            channel_id,
+        )
+        self.assertEqual(
+            extract_youtube_channel_id(
+                f'<meta itemprop="channelId" content="{channel_id}">'
+            ),
+            channel_id,
         )
 
 
