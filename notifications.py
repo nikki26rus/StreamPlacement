@@ -147,6 +147,23 @@ def format_live_notification(
     return "\n\n".join(lines)
 
 
+def format_subscriber_notification(
+    notifications: list[tuple[sqlite3.Row, LiveStream]],
+) -> str:
+    """Формирует личное уведомление без технических счётчиков."""
+    lines = ["🔴 <b>Эфир начался</b>"]
+    for subscription, stream in notifications:
+        streamer = html.escape(str(subscription["channel_name"]))
+        platform = html.escape(PLATFORM_NAMES[subscription["platform"]])
+        title = html.escape(stream.title or "Без названия")
+        details = [f"<b>{streamer}</b> начал эфир на <b>{platform}</b>"]
+        if stream.game_name:
+            details.append(html.escape(stream.game_name))
+        details.append(f"«{title}»")
+        lines.append("\n".join(details))
+    return "\n\n".join(lines)
+
+
 def custom_button_rows(
     custom_buttons: list[dict[str, str | int]],
     button_style: str | None,
@@ -268,11 +285,14 @@ async def send_or_edit_notification(
         database.clear_notification_message(chat_id)
         return
 
-    text = format_live_notification(
-        notifications,
-        settings["notification_template"],
-        settings["notification_description"],
-    )
+    if database.get_user_mode(chat_id) == "subscriber":
+        text = format_subscriber_notification(notifications)
+    else:
+        text = format_live_notification(
+            notifications,
+            settings["notification_template"],
+            settings["notification_description"],
+        )
     reply_markup = notification_keyboard(
         database.get_chat_subscriptions(chat_id),
         database.get_button_emojis(chat_id),
