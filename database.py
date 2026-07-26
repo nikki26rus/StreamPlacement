@@ -70,6 +70,33 @@ class Database:
                 mode TEXT NOT NULL CHECK(mode IN ('streamer', 'subscriber')),
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS weekly_schedule_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+                time TEXT NOT NULL CHECK(
+                    time GLOB '[0-2][0-9]:[0-5][0-9]'
+                    AND substr(time, 1, 2) BETWEEN '00' AND '23'
+                ),
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS weekly_schedule_items_chat_order
+            ON weekly_schedule_items(chat_id, weekday, time, id);
+
+            CREATE TABLE IF NOT EXISTS weekly_schedule_settings (
+                chat_id INTEGER PRIMARY KEY,
+                image_file_id TEXT,
+                thread_id INTEGER,
+                posted_message_id INTEGER,
+                posted_message_has_photo INTEGER NOT NULL DEFAULT 0
+                    CHECK(posted_message_has_photo IN (0, 1)),
+                FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+            );
             """
         )
         chat_columns = {
@@ -104,6 +131,16 @@ class Database:
                 self.connection.execute(
                     f"ALTER TABLE chats ADD COLUMN {name} {definition}"
                 )
+        schedule_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(weekly_schedule_settings)"
+            ).fetchall()
+        }
+        if "thread_id" not in schedule_columns:
+            self.connection.execute(
+                "ALTER TABLE weekly_schedule_settings ADD COLUMN thread_id INTEGER"
+            )
         subscriptions_sql = self.connection.execute(
             """
             SELECT sql FROM sqlite_master
@@ -674,6 +711,142 @@ class Database:
             (chat_id,),
         )
         self.connection.commit()
+
+    def list_schedule_items(self, chat_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT id, weekday, time, title, description
+            FROM weekly_schedule_items
+            WHERE chat_id = ?
+            ORDER BY weekday, time, id
+            """,
+            (chat_id,),
+        ).fetchall()
+
+    def add_schedule_item(
+        self,
+        chat_id: int,
+        weekday: int,
+        time: str,
+        title: str,
+        description: str,
+    ) -> int:
+        self._validate_schedule_item(weekday, time)
+        cursor = self.connection.execute(
+            """
+            INSERT INTO weekly_schedule_items(
+                chat_id, weekday, time, title, description
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (chat_id, weekday, time, title, description),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def update_schedule_item(
+        self,
+        chat_id: int,
+        item_id: int,
+        weekday: int,
+        time: str,
+        title: str,
+        description: str,
+    ) -> bool:
+        self._validate_schedule_item(weekday, time)
+        cursor = self.connection.execute(
+            """
+            UPDATE weekly_schedule_items
+            SET weekday = ?, time = ?, title = ?, description = ?
+            WHERE id = ? AND chat_id = ?
+            """,
+            (weekday, time, title, description, item_id, chat_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def delete_schedule_item(self, chat_id: int, item_id: int) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM weekly_schedule_items WHERE id = ? AND chat_id = ?",
+            (item_id, chat_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def get_schedule_image_file_id(self, chat_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT image_file_id FROM weekly_schedule_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return str(row["image_file_id"]) if row and row["image_file_id"] else None
+
+    def get_schedule_thread_id(self, chat_id: int) -> int | None:
+        row = self.connection.execute(
+            "SELECT thread_id FROM weekly_schedule_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return int(row["thread_id"]) if row and row["thread_id"] else None
+
+    def set_schedule_thread_id(self, chat_id: int, thread_id: int | None) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO weekly_schedule_settings(chat_id, thread_id)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET thread_id = excluded.thread_id
+            """,
+            (chat_id, thread_id),
+        )
+        self.connection.commit()
+
+    def set_schedule_image_file_id(self, chat_id: int, file_id: str | None) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO weekly_schedule_settings(chat_id, image_file_id)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET image_file_id = excluded.image_file_id
+            """,
+            (chat_id, file_id),
+        )
+        self.connection.commit()
+
+    def get_schedule_message(self, chat_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT posted_message_id, posted_message_has_photo
+            FROM weekly_schedule_settings
+            WHERE chat_id = ? AND posted_message_id IS NOT NULL
+            """,
+            (chat_id,),
+        ).fetchone()
+
+    def set_schedule_message(
+        self, chat_id: int, message_id: int | None, *, has_photo: bool = False
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO weekly_schedule_settings(
+                chat_id, posted_message_id, posted_message_has_photo
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                posted_message_id = excluded.posted_message_id,
+                posted_message_has_photo = excluded.posted_message_has_photo
+            """,
+            (chat_id, message_id, int(has_photo) if message_id is not None else 0),
+        )
+        self.connection.commit()
+
+    @staticmethod
+    def _validate_schedule_item(weekday: int, time: str) -> None:
+        if not isinstance(weekday, int) or isinstance(weekday, bool) or not 0 <= weekday <= 6:
+            raise ValueError("День недели должен быть числом от 0 до 6")
+        if (
+            len(time) != 5
+            or time[2] != ":"
+            or not time[:2].isdigit()
+            or not time[3:].isdigit()
+            or not 0 <= int(time[:2]) <= 23
+            or not 0 <= int(time[3:]) <= 59
+        ):
+            raise ValueError("Время должно быть в формате HH:MM")
 
     def reset_notification_settings(self, chat_id: int) -> None:
         """Сбрасывает оформление и параметры уведомлений, не затрагивая подписки."""
