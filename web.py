@@ -216,6 +216,10 @@ def _schedule_text(db: Database, chat_id: int) -> str:
 
 def create_app(bot_application=None) -> FastAPI:
     """Creates the web service. bot_application is supplied by bot.py at runtime."""
+    # На новом или пустом постоянном томе BotHost папки ещё нет.
+    # StaticFiles требует существующую папку во время регистрации маршрута,
+    # то есть до запуска lifespan.
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
