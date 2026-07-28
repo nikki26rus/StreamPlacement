@@ -1,8 +1,10 @@
 import html
+import asyncio
 import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -37,6 +39,9 @@ from config import (
     SLOW_SCRAPE_POLL_INTERVAL_SECONDS,
     TWITCH_CLIENT_ID,
     TWITCH_CLIENT_SECRET,
+    WEB_ENABLED,
+    WEB_HOST,
+    WEB_PORT,
     YOUTUBE_POLL_INTERVAL_SECONDS,
 )
 from constants import (
@@ -3642,6 +3647,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
+    application.bot_data["event_loop"] = asyncio.get_running_loop()
     await application.bot.delete_my_commands()
     await application.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     application.job_queue.run_repeating(
@@ -3656,6 +3662,25 @@ async def post_init(application: Application) -> None:
         YOUTUBE_POLL_INTERVAL_SECONDS,
         SLOW_SCRAPE_POLL_INTERVAL_SECONDS,
     )
+
+
+def start_web_server(application: Application) -> None:
+    """Runs FastAPI in a dedicated thread without changing polling behavior."""
+    if not WEB_ENABLED:
+        logger.info("Веб-интерфейс отключён переменной WEB_ENABLED")
+        return
+    try:
+        import uvicorn
+        from web import create_app
+    except ImportError as error:
+        logger.warning("Веб-интерфейс не запущен: %s", error)
+        return
+    server = uvicorn.Server(
+        uvicorn.Config(create_app(application), host=WEB_HOST, port=WEB_PORT, log_level="info")
+    )
+    thread = threading.Thread(target=server.run, name="stream-notifier-web", daemon=True)
+    thread.start()
+    logger.info("Веб-интерфейс запущен на http://%s:%d", WEB_HOST, WEB_PORT)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -3830,6 +3855,7 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler)
     )
 
+    start_web_server(application)
     logger.info("Бот уведомлений запущен")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
