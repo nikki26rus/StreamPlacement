@@ -237,6 +237,10 @@ def create_app(bot_application=None) -> FastAPI:
     async def site() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
     @app.get("/api/public-config")
     async def public_config() -> dict:
         return {"telegram_login_bot_username": TELEGRAM_LOGIN_BOT_USERNAME}
