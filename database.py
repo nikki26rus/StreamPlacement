@@ -11,6 +11,10 @@ class Database:
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        # The bot and the web service use separate SQLite connections. WAL keeps
+        # readers responsive while short configuration updates are committed.
+        self.connection.execute("PRAGMA journal_mode = WAL")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS chats (
@@ -91,6 +95,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS weekly_schedule_settings (
                 chat_id INTEGER PRIMARY KEY,
                 image_file_id TEXT,
+                web_image_path TEXT,
                 thread_id INTEGER,
                 posted_message_id INTEGER,
                 posted_message_has_photo INTEGER NOT NULL DEFAULT 0
@@ -140,6 +145,10 @@ class Database:
         if "thread_id" not in schedule_columns:
             self.connection.execute(
                 "ALTER TABLE weekly_schedule_settings ADD COLUMN thread_id INTEGER"
+            )
+        if "web_image_path" not in schedule_columns:
+            self.connection.execute(
+                "ALTER TABLE weekly_schedule_settings ADD COLUMN web_image_path TEXT"
             )
         subscriptions_sql = self.connection.execute(
             """
@@ -607,6 +616,18 @@ class Database:
         self.connection.commit()
         return True
 
+    def set_custom_button_url(self, chat_id: int, index: int, url: str) -> bool:
+        buttons = self.get_custom_buttons(chat_id)
+        if not 0 <= index < len(buttons):
+            return False
+        buttons[index]["url"] = url
+        self.connection.execute(
+            "UPDATE chats SET custom_buttons = ? WHERE chat_id = ?",
+            (json.dumps(buttons, ensure_ascii=False), chat_id),
+        )
+        self.connection.commit()
+        return True
+
     def set_custom_button_emoji(
         self,
         chat_id: int,
@@ -805,6 +826,29 @@ class Database:
             ON CONFLICT(chat_id) DO UPDATE SET image_file_id = excluded.image_file_id
             """,
             (chat_id, file_id),
+        )
+        self.connection.commit()
+
+    def get_schedule_web_image_path(self, chat_id: int) -> str | None:
+        """Web uploads are local files, unlike Telegram's opaque file_id values."""
+        row = self.connection.execute(
+            "SELECT web_image_path FROM weekly_schedule_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return str(row["web_image_path"]) if row and row["web_image_path"] else None
+
+    def get_schedule_web_image_url(self, chat_id: int) -> str | None:
+        path = self.get_schedule_web_image_path(chat_id)
+        return f"/uploads/{Path(path).name}" if path else None
+
+    def set_schedule_web_image_path(self, chat_id: int, path: str | None) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO weekly_schedule_settings(chat_id, web_image_path)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET web_image_path = excluded.web_image_path
+            """,
+            (chat_id, path),
         )
         self.connection.commit()
 
