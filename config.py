@@ -33,7 +33,10 @@ NOTIFICATION_TIMEZONE = os.getenv("NOTIFICATION_TIMEZONE", "Europe/Moscow")
 DB_PATH = Path(os.getenv("DB_PATH", "data/streams.db"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "20"))
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip()
-WEB_PORT = max(1, min(65535, int(os.getenv("WEB_PORT", "8080"))))
+WEB_PORT = max(
+    1,
+    min(65535, int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))),
+)
 WEB_AUTH_MAX_AGE_SECONDS = max(
     60, int(os.getenv("WEB_AUTH_MAX_AGE_SECONDS", "86400"))
 )
