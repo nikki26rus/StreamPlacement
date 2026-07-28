@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101524">
+  <title>Stream Notifier</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="glow glow-one"></div><div class="glow glow-two"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark">◉</span><span>Stream <b>Notifier</b></span></a>
+      <div id="user-bar"></div>
+    </header>
+
+    <section id="login" class="hero">
+      <p class="eyebrow">ЛИЧНЫЙ КАБИНЕТ</p>
+      <h1>Уведомления о стримах.<br><em>В вашем стиле.</em></h1>
+      <p class="lead">Управляйте подписками, оформлением и расписанием. Вход выполняется через Telegram — мы не запрашиваем пароль и не видим ваши личные сообщения.</p>
+      <div id="telegram-login" class="login-box">
+        <p>Загружаем безопасный вход Telegram…</p>
+      </div>
+      <p class="hint">Войдите тем же Telegram-аккаунтом, с которого вы настраивали бота.</p>
+    </section>
+
+    <section id="cabinet" hidden>
+      <div class="welcome"><div><p class="eyebrow">ВАША РАБОЧАЯ ОБЛАСТЬ</p><h1 id="welcome-title">Добро пожаловать</h1></div><button class="ghost" id="logout">Выйти</button></div>
+      <div id="mode-picker" class="mode-picker"></div>
+      <nav class="tabs" aria-label="Разделы кабинета">
+        <button data-tab="subscriptions" class="active">Подписки</button>
+        <button data-tab="appearance">Оформление</button>
+        <button data-tab="buttons">Кнопки</button>
+        <button data-tab="schedule">Расписание</button>
+        <button data-tab="help">Помощь</button>
+      </nav>
+      <div id="content"></div>
+    </section>
+  </main>
+  <template id="toast-template"><div class="toast"></div></template>
+  <script src="/static/app.js" defer></script>
+  <script src="/static/enhancements.js" defer></script>
+</body>
+</html>
